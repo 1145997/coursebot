@@ -2878,6 +2878,80 @@ class AutomationWorker(threading.Thread):
                 "warning",
             )
 
+    @staticmethod
+    def _task_dot_color(frame: Frame, line: OcrLine) -> str | None:
+        """看“任务点”左侧圆点是黄色未完成，还是绿色已完成。"""
+        try:
+            h, w = frame.image.shape[:2]
+            x0 = max(0, int(line.x0) - 40)
+            x1 = max(x0 + 1, int(line.x0) - 2)
+            y0 = max(0, int(line.cy) - 18)
+            y1 = min(h, int(line.cy) + 18)
+            crop = frame.image[y0:y1, x0:x1]
+            if crop.size == 0:
+                return None
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            yellow = cv2.inRange(hsv, (8, 80, 100), (40, 255, 255))
+            green = cv2.inRange(hsv, (40, 80, 80), (90, 255, 255))
+            yn = int((yellow > 0).sum())
+            gn = int((green > 0).sum())
+            if yn >= 12 and yn >= gn:
+                return "yellow"
+            if gn >= 12 and gn > yn:
+                return "green"
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _dark_video_rects(frame: Frame) -> list[tuple[int, int, int, int]]:
+        """找页面正文里的黑色视频矩形，不依赖任务点数字。"""
+        img = frame.image
+        h, w = img.shape[:2]
+        x0, x1 = int(w * 0.03), int(w * 0.72)
+        y0, y1 = int(h * 0.02), int(h * 0.98)
+        gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        mask = (gray < 32).astype(np.uint8) * 255
+        kernel = np.ones((11, 11), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        rects = []
+        for contour in contours:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            if cw < (x1 - x0) * 0.30 or ch < (y1 - y0) * 0.12:
+                continue
+            if cw * ch < (x1 - x0) * (y1 - y0) * 0.05:
+                continue
+            rects.append((x0 + x, y0 + y, cw, ch))
+        rects.sort(key=lambda r: r[1])
+        return rects
+
+    def _find_unfinished_video_below(
+        self, frame: Frame, view: PageView, min_y: float
+    ) -> tuple[int, int] | None:
+        """在 min_y 下方找“黄色任务点 + 黑色视频”，返回视频中心。"""
+        labels = [
+            line
+            for line in view.lines
+            if compact_text(line.text) == "任务点" and line.cy > min_y
+        ]
+        rects = self._dark_video_rects(frame)
+        for label in sorted(labels, key=lambda l: l.cy):
+            if self._task_dot_color(frame, label) != "yellow":
+                continue
+            below = [
+                rect
+                for rect in rects
+                if rect[1] >= label.y1 - 10 and rect[1] <= label.cy + 700
+            ]
+            if not below:
+                continue
+            x, y, cw, ch = below[0]
+            return x + cw // 2, y + ch // 2
+        return None
+
     def _try_next_video_on_page(self, frame: Frame) -> bool:
         """视频播完后向下滚动；只要发现“另一个未结束的视频”就继续播。"""
         x = self.window.left + int(self.window.width * 0.42)
@@ -2891,6 +2965,33 @@ class AutomationWorker(threading.Thread):
             self._sleep(1.0)
             frame = self._grab()
             view = self._scan(frame)
+            min_y = (self.time_box.cy + 40) if self.time_box else 0
+            target = self._find_unfinished_video_below(frame, view, min_y)
+            if target:
+                self._log(
+                    "下方还有黄色任务点的黑色视频，点击播放",
+                    "warning",
+                )
+                self._click_screen(target[0], target[1], "下方未完成视频")
+                self._sleep(2.0)
+                try:
+                    self.clicker.scroll(x, y, -2)
+                except Exception:
+                    pass
+                self._sleep(0.6)
+                frame = self._grab()
+                view = self._scan(frame)
+                if view.time and view.time.duration > 0 and (
+                    view.time.current < view.time.duration - 5
+                ):
+                    self._adopt_time(view.time)
+                    self.completion_handled = False
+                    self.end_streak = 0
+                    self.last_progress_wall = time.time()
+                    return True
+                self.completion_handled = False
+                self._force_full = True
+                return True
             # 同页下一个视频可能还是黑色画面 + 中央播放钮，没有时间。
             # 中央按钮必须在上一个视频控制栏的下方，避免误点上一个视频的重播按钮。
             px, py, found = self._find_center_play_button(frame)
