@@ -2952,86 +2952,74 @@ class AutomationWorker(threading.Thread):
             return x + cw // 2, y + ch // 2
         return None
 
-    def _try_next_video_on_page(self, frame: Frame) -> bool:
-        """视频播完后向下滚动；只要发现“另一个未结束的视频”就继续播。"""
-        x = self.window.left + int(self.window.width * 0.42)
-        y = self.window.top + int(self.window.height * 0.58)
-        for _ in range(8):
-            try:
-                # 小幅滚动，避免一次跳过中间那个视频。
-                self.clicker.scroll(x, y, -4)
-            except Exception:
-                break
-            self._sleep(1.0)
-            frame = self._grab()
-            view = self._scan(frame)
-            min_y = (self.time_box.cy + 40) if self.time_box else 0
-            target = self._find_unfinished_video_below(frame, view, min_y)
-            if target:
-                self._log(
-                    "下方还有黄色任务点的黑色视频，点击播放",
-                    "warning",
-                )
-                self._click_screen(target[0], target[1], "下方未完成视频")
-                self._sleep(2.0)
-                try:
-                    self.clicker.scroll(x, y, -2)
-                except Exception:
-                    pass
-                self._sleep(0.6)
-                frame = self._grab()
-                view = self._scan(frame)
-                if view.time and view.time.duration > 0 and (
-                    view.time.current < view.time.duration - 5
-                ):
-                    self._adopt_time(view.time)
-                    self.completion_handled = False
-                    self.end_streak = 0
-                    self.last_progress_wall = time.time()
-                    return True
-                self.completion_handled = False
-                self._force_full = True
-                return True
-            # 同页下一个视频可能还是黑色画面 + 中央播放钮，没有时间。
-            # 中央按钮必须在上一个视频控制栏的下方，避免误点上一个视频的重播按钮。
-            px, py, found = self._find_center_play_button(frame)
-            clicked_center = False
-            if found and (
-                not view.time or py > view.time.line.cy + 60
-            ):
-                clicked_center = True
-                self._click_screen(px, py, "同页下一个视频播放按钮")
-                self._sleep(2.0)
-                # 再向下滚一点，让上一个视频的结束时间移出画面。
-                try:
-                    self.clicker.scroll(x, y, -2)
-                except Exception:
-                    pass
-                self._sleep(0.6)
-                frame = self._grab()
-                view = self._scan(frame)
-            if not view.time or view.time.duration <= 0:
-                if clicked_center:
-                    self.completion_handled = False
-                    self._force_full = True
-                    self._log("已点击下一个视频的中央播放钮，等待时间加载", "warning")
-                    return True
-                continue
-            # 第一个视频刚播完时仍可能留在画面上，时间接近结尾，必须排除。
-            if view.time.current >= view.time.duration - 5:
-                continue
+    def _activate_unfinished_video(
+        self, frame: Frame, view: PageView, min_y: float
+    ) -> bool:
+        target = self._find_unfinished_video_below(frame, view, min_y)
+        if not target:
+            return False
+        self._log("发现下方黄色任务点的黑色视频，点击播放", "warning")
+        self._click_screen(target[0], target[1], "下方未完成视频")
+        self._sleep(2.0)
+        try:
+            x = self.window.left + int(self.window.width * 0.42)
+            y = self.window.top + int(self.window.height * 0.58)
+            self.clicker.scroll(x, y, -2)
+        except Exception:
+            pass
+        self._sleep(0.6)
+        frame = self._grab()
+        view = self._scan(frame)
+        if view.time and view.time.duration > 0 and (
+            view.time.current < view.time.duration - 5
+        ):
             self._adopt_time(view.time)
-            self.completion_handled = False
             self.end_streak = 0
             self.last_progress_wall = time.time()
-            self._log(
-                f"同页发现下一个视频：{view.time.current_text()} / "
-                f"{view.time.duration_text()}，继续播放",
-                "warning",
-            )
-            self._status("playing", "继续播放同页下一个视频")
+            self.completion_handled = False
             return True
-        self._log("已向下滚动，没有发现同页下一个未结束的视频", "warning")
+        self.completion_handled = False
+        self._force_full = True
+        return True
+
+    def _try_next_video_on_page(self, frame: Frame) -> bool:
+        """视频播完后慢慢向下扫；每一小步都检查黄色任务点+黑色视频。"""
+        x = self.window.left + int(self.window.width * 0.42)
+        y = self.window.top + int(self.window.height * 0.58)
+        min_y = (self.time_box.cy + 40) if self.time_box else 0
+
+        # 先看当前画面，第二个视频可能已经在下方可见，不能先滚过头。
+        view = self._scan(frame)
+        if self._activate_unfinished_video(frame, view, min_y):
+            return True
+
+        for _ in range(16):
+            try:
+                # 每次只滚 2 格，慢扫，避免直接滑过中间视频。
+                self.clicker.scroll(x, y, -2)
+            except Exception:
+                break
+            self._sleep(0.8)
+            frame = self._grab()
+            view = self._scan(frame)
+            if self._activate_unfinished_video(frame, view, min_y):
+                return True
+
+            # 没有黄色任务点时，再看是否有另一个未结束的视频时间。
+            if view.time and view.time.duration > 0 and (
+                view.time.current < view.time.duration - 5
+            ):
+                self._adopt_time(view.time)
+                self.completion_handled = False
+                self.end_streak = 0
+                self.last_progress_wall = time.time()
+                self._log(
+                    f"同页发现下一个视频：{view.time.current_text()} / "
+                    f"{view.time.duration_text()}，继续播放",
+                    "warning",
+                )
+                return True
+        self._log("已慢速向下扫到底，没有发现同页下一个未完成视频", "warning")
         return False
 
     def _advance(self, reason: str) -> bool:
