@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$version = "1.9.3"
+$version = "1.9.4"
 $stageName = "CourseBot-v$version-win64"
 $releaseRoot = Join-Path $PSScriptRoot "release"
 $stage = Join-Path $releaseRoot $stageName

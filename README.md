@@ -1,4 +1,4 @@
-# 网课自动学习助手（CourseBot）v1.9.3
+# 网课自动学习助手（CourseBot）v1.9.4
 
 Windows 桌面端网课自动化工具：
 
@@ -43,7 +43,7 @@ Windows 桌面端网课自动化工具：
 
 ## 3. 发布版使用
 
-1. 解压 `CourseBot-v1.9.3-win64.zip`；
+1. 解压 `CourseBot-v1.9.4-win64.zip`；
 2. 必须保留 `CourseBot.exe` 和 `_internal` 文件夹在同一目录；
 3. 双击 `CourseBot.exe`；
 4. 首次运行会在 exe 同级生成：
@@ -219,8 +219,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_release.ps1
 产物：
 
 - `dist\CourseBot\CourseBot.exe`
-- `release\CourseBot-v1.9.3-win64\`
-- `release\CourseBot-v1.9.3-win64.zip`
+- `release\CourseBot-v1.9.4-win64\`
+- `release\CourseBot-v1.9.4-win64.zip`
 - `release\SHA256SUMS.txt`
 
 打包固定使用：

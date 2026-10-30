@@ -520,6 +520,20 @@ class AutomationWorker(threading.Thread):
             for key in ("暂无内容", "暂无课程内容", "暂无学习内容", "暂无资源")
         )
 
+    def _handle_unfinished_confirm(self, view: PageView) -> bool:
+        """点下一节后出现“当前章节还有任务点未完成”，必须点“去学习”。"""
+        text = "".join(compact_text(line.text) for line in view.lines)
+        if "还有任务点未完成" not in text and "是否去完成" not in text:
+            return False
+        go = find_button(view.lines, ["去学习", "继续学习"], exact=False)
+        if not go:
+            return False
+        self._log("提示还有任务点未完成，点击“去学习”而不是下一节", "warning")
+        self._status("playing", "还有任务点，返回继续学习")
+        self._click_line(go, "未完成任务点-去学习")
+        self._sleep(1.8)
+        return True
+
     def _click_empty_next(self, view: PageView) -> bool:
         """“暂无内容”页单帧判断，直接点下一节。"""
         if not self._is_empty_content_page(view):
@@ -627,6 +641,8 @@ class AutomationWorker(threading.Thread):
 
     def _apply_initial(self, frame: Frame, view: PageView) -> None:
         self._note_page_videos(view)
+        if self._handle_unfinished_confirm(view):
+            return
         if view.exam.detected:
             self._handle_exam(view, frame)
             frame = self._grab()
@@ -900,6 +916,8 @@ class AutomationWorker(threading.Thread):
 
     def _handle_scan_interrupts(self, view: PageView, frame: Frame) -> bool:
         self._note_page_videos(view)
+        if self._handle_unfinished_confirm(view):
+            return True
         if view.exam.detected:
             if view.exam.result and self._chapter_quiz_done:
                 self._advance("章节测验已完成")
@@ -924,6 +942,8 @@ class AutomationWorker(threading.Thread):
         return False
 
     def _handle_no_time(self, frame: Frame, view: PageView) -> None:
+        if self._handle_unfinished_confirm(view):
+            return
         if view.exam.detected:
             self._handle_exam(view, frame)
             return
@@ -2993,6 +3013,9 @@ class AutomationWorker(threading.Thread):
                 self._sleep(max(0.9, min(1.5, self.settings.nav_wait_seconds)))
                 new_frame = self._grab()
                 new_view = self._scan(new_frame)
+                if self._handle_unfinished_confirm(new_view):
+                    self.completion_handled = False
+                    return True
                 if new_view.quiz.detected:
                     self._handle_quiz(new_view, new_frame)
                     self.completion_handled = False
