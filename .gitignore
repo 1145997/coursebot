@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+config.json
+config.broken.json
+logs/
+.venv/
+venv/
+*.log
+build/
+dist/
+_test_extract/
+release/
+*.zip
+diag_build.log
+diag.spec
+diag.py
