@@ -2891,19 +2891,30 @@ class AutomationWorker(threading.Thread):
             self._sleep(1.0)
             frame = self._grab()
             view = self._scan(frame)
-            if not view.time:
-                # 同页第二个视频常是黑色画面 + 中央播放钮，时间还没加载。
-                labels = sum(
-                    1 for line in view.lines if compact_text(line.text) == "任务点"
-                )
-                if labels >= 2:
-                    px, py, found = self._find_center_play_button(frame)
-                    if found:
-                        self._click_screen(px, py, "同页下一个视频播放按钮")
-                        self._sleep(2.0)
-                        frame = self._grab()
-                        view = self._scan(frame)
+            # 同页下一个视频可能还是黑色画面 + 中央播放钮，没有时间。
+            # 中央按钮必须在上一个视频控制栏的下方，避免误点上一个视频的重播按钮。
+            px, py, found = self._find_center_play_button(frame)
+            clicked_center = False
+            if found and (
+                not view.time or py > view.time.line.cy + 60
+            ):
+                clicked_center = True
+                self._click_screen(px, py, "同页下一个视频播放按钮")
+                self._sleep(2.0)
+                # 再向下滚一点，让上一个视频的结束时间移出画面。
+                try:
+                    self.clicker.scroll(x, y, -2)
+                except Exception:
+                    pass
+                self._sleep(0.6)
+                frame = self._grab()
+                view = self._scan(frame)
             if not view.time or view.time.duration <= 0:
+                if clicked_center:
+                    self.completion_handled = False
+                    self._force_full = True
+                    self._log("已点击下一个视频的中央播放钮，等待时间加载", "warning")
+                    return True
                 continue
             # 第一个视频刚播完时仍可能留在画面上，时间接近结尾，必须排除。
             if view.time.current >= view.time.duration - 5:
