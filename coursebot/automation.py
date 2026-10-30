@@ -305,6 +305,8 @@ class AutomationWorker(threading.Thread):
             self._log("目标窗口未完全显示在屏幕内，部分识别/点击可能失败", "warning")
         self._log(f"窗口客户区：{self.window.width}×{self.window.height} @ ({self.window.left},{self.window.top})")
         self._status("scanning", "正在扫描页面…")
+        # 上次可能停在页面中部；先回到顶部，避免漏掉上面的视频任务点。
+        self._scroll_content_top()
         self._wake_controls()
         self._sleep(0.15)
         frame = self._grab()
@@ -1440,6 +1442,18 @@ class AutomationWorker(threading.Thread):
         )
         self.last_progress_wall = time.time()
         return
+
+    def _scroll_content_top(self, amount: int = 24) -> None:
+        """把页面正文（不是右侧目录）滚回顶部。"""
+        if not is_foreground(self.window.hwnd):
+            return
+        x = self.window.left + int(self.window.width * 0.42)
+        y = self.window.top + int(self.window.height * 0.55)
+        try:
+            self.clicker.scroll(x, y, amount)
+            self._sleep(0.6)
+        except Exception:
+            pass
 
     def _wake_controls(self) -> None:
         """在视频区域内做几次明显的鼠标移动，让自动隐藏的控制栏出现。"""
@@ -2868,9 +2882,10 @@ class AutomationWorker(threading.Thread):
         """视频播完后向下滚动；只要发现“另一个未结束的视频”就继续播。"""
         x = self.window.left + int(self.window.width * 0.42)
         y = self.window.top + int(self.window.height * 0.58)
-        for _ in range(4):
+        for _ in range(8):
             try:
-                self.clicker.scroll(x, y, -8)
+                # 小幅滚动，避免一次跳过中间那个视频。
+                self.clicker.scroll(x, y, -4)
             except Exception:
                 break
             self._sleep(1.0)
@@ -3011,6 +3026,7 @@ class AutomationWorker(threading.Thread):
                 self._status("navigating", f"已点击下一节，等待页面加载（{attempt}/{attempts}）…")
                 # 页面切换通常 0.5~1.5 秒；先短等再确认，避免每次白等 5 秒。
                 self._sleep(max(0.9, min(1.5, self.settings.nav_wait_seconds)))
+                self._scroll_content_top()
                 new_frame = self._grab()
                 new_view = self._scan(new_frame)
                 if self._handle_unfinished_confirm(new_view):
