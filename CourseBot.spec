@@ -18,7 +18,7 @@ datas += collect_data_files("uiautomation")
 hiddenimports += collect_submodules("uiautomation")
 
 # onnxruntime 的 DLL / provider 插件
-binaries = collect_dynamic_libs("onnxruntime")
+binaries = collect_dynamic_libs("onnxruntime") + collect_dynamic_libs("uiautomation")
 hiddenimports += ["onnxruntime.capi._pybind_state"]
 
 a = Analysis(

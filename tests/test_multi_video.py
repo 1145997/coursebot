@@ -2,7 +2,7 @@
 import queue
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -13,7 +13,8 @@ from coursebot.config import Settings
 from coursebot.ocr import OcrLine
 from coursebot.vision import PageView, SectionRow, TimeReading, VideoTask, analyze_page, parse_time_text
 from coursebot.windows import WindowInfo
-from coursebot.course_state import CourseSnapshot
+from coursebot.course_state import CourseSnapshot, CourseVideo, PendingChapter
+from coursebot.accessibility import AccessibilityActionError
 
 
 def line(text, y, x=130):
@@ -228,6 +229,67 @@ class VideoNavigationTests(unittest.TestCase):
         w._handle_accessible_nonvideo.assert_not_called()
         w._scan.assert_not_called()
         w._click_screen.assert_not_called()
+
+    def test_changed_browser_control_is_retried_only_after_a_fresh_decision(self):
+        w = self.worker
+        w._browser_reader = Mock()
+        w._browser_reader.activate.side_effect = AccessibilityActionError("stale")
+        self.assertFalse(w._activate_accessible("old-token", "video3"))
+        w._browser_reader.activate.assert_called_once()
+        w._click_screen.assert_not_called()
+        w._browser_reader.activate.side_effect = None
+        self.assertTrue(w._activate_accessible("fresh-token", "video3"))
+        self.assertNotIn("video3", w._action_failures)
+
+    def test_repeated_action_failure_is_bounded(self):
+        w = self.worker
+        w._browser_reader = Mock()
+        w._browser_reader.activate.side_effect = AccessibilityActionError("stale")
+        self.assertFalse(w._activate_accessible("token", "video3"))
+        self.assertFalse(w._activate_accessible("token", "video3"))
+        with self.assertRaises(NavigationFailed):
+            w._activate_accessible("token", "video3")
+
+    def test_uncertain_invoke_is_not_repeated_when_fresh_snapshot_is_playing(self):
+        w = self.worker
+        w.settings.save_debug_frames = False
+        w._browser_reader = Mock()
+        w._browser_reader.activate.side_effect = AccessibilityActionError("invoke outcome unknown")
+        paused = CourseSnapshot("course:123", [CourseVideo("v1", 1, False, 0, 500, True, "play")], page_kind="video")
+        with patch("coursebot.automation.time.monotonic", return_value=10):
+            w._accessible_video_tick(paused)
+        with patch("coursebot.automation.time.monotonic", return_value=14):
+            w._accessible_video_tick(paused)
+        playing = CourseSnapshot("course:123", [CourseVideo("v1", 1, False, 1, 500, False, "pause")], page_kind="video")
+        with patch("coursebot.automation.time.monotonic", return_value=15):
+            w._accessible_video_tick(playing)
+        w._browser_reader.activate.assert_called_once()
+        w._click_screen.assert_not_called()
+
+    def test_new_chapter_does_not_skip_using_temporarily_old_completed_player(self):
+        w = self.worker
+        w.settings.save_debug_frames = False
+        w._browser_reader = Mock()
+        w._open_accessible_pending = Mock()
+        snapshot = CourseSnapshot("course:new", [CourseVideo("v1", 1, True)], page_kind="video")
+        with patch("coursebot.automation.time.monotonic", return_value=10):
+            self.assertTrue(w._accessible_video_tick(snapshot))
+        w._open_accessible_pending.assert_not_called()
+        w._browser_reader.activate.assert_not_called()
+
+    def test_green_players_with_pending_current_chapter_wait_for_writeback(self):
+        w = self.worker
+        w.settings.save_debug_frames = False
+        w._browser_reader = Mock()
+        w._open_accessible_pending = Mock()
+        snapshot = CourseSnapshot("course:123", [CourseVideo("v1", 1, True)],
+                                  pending=[PendingChapter("cur123", "current", "token")], page_kind="video")
+        with patch("coursebot.automation.time.monotonic", return_value=10):
+            w._accessible_video_tick(snapshot)
+        with patch("coursebot.automation.time.monotonic", return_value=14):
+            w._accessible_video_tick(snapshot)
+        w._open_accessible_pending.assert_not_called()
+        w._browser_reader.activate.assert_not_called()
 
 
 if __name__ == "__main__":

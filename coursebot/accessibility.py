@@ -14,6 +14,10 @@ from .course_state import CourseSnapshot, CourseVideo, PendingChapter
 from .vision import parse_time_text
 
 
+class AccessibilityActionError(RuntimeError):
+    """控件移动或失效后必须重新读取，再按当前状态决定操作。"""
+
+
 @dataclass
 class AccessibleNode:
     name: str = ""
@@ -164,13 +168,17 @@ def snapshot_from_tree(root: AccessibleNode, complete: bool = True, problem: str
                 number = next((name for name in names if re.fullmatch(r"\d+(?:\.\d+)+", name)), "")
                 title = f"{number} {title_node.label}".strip()
                 snapshot.pending.append(PendingChapter(node.automation_id, title, title_node.token))
+    tab_bar = next((node for node in ordered if node.automation_id == "prev_tab"), None)
+    tab_nodes = [node for node in ordered if node.role in {"option", "tab"}]
+    if tab_bar:
+        tab_nodes += [node for node in tab_bar.walk() if re.fullmatch(r"dct\d+", node.automation_id)]
     if not snapshot.videos:
-        video_tab = next((node for node in ordered if node.role in {"option", "tab"} and
+        video_tab = next((node for node in tab_nodes if
                           re.fullmatch(r"\d*\s*视频", node.label) and node.token), None)
         if video_tab:
             snapshot.video_tab_token = video_tab.token
             snapshot.video_tab_selected = video_tab.selected
-    quiz_tab = next((node for node in ordered if node.role in {"option", "tab"} and
+    quiz_tab = next((node for node in tab_nodes if
                      re.fullmatch(r"\d*\s*章节测验", node.label) and node.token), None)
     if quiz_tab:
         snapshot.quiz_tab_token = quiz_tab.token
@@ -199,10 +207,15 @@ class BrowserAccessibility:
         self._controls = {}
         self._generation = 0
         self._native = None
+        self._ancestors = {}
+        self._offscreen = {}
+        self.last_action = ""
         self.last_tree: AccessibleNode | None = None
 
     def close(self):
         self._controls.clear()
+        self._ancestors.clear()
+        self._offscreen.clear()
         self._native = None
         if self._initializer:
             self._initializer.Uninitialize()
@@ -225,6 +238,8 @@ class BrowserAccessibility:
         started = time.monotonic()
         self._generation += 1
         self._controls.clear()
+        self._ancestors.clear()
+        self._offscreen.clear()
         self.last_tree = None
         client = self._native
         request = client.CreateCacheRequest()
@@ -233,7 +248,7 @@ class BrowserAccessibility:
         request.AutomationElementMode = 1  # Full: 保留对最近快照控件的实际操作能力
         props = {
             "name": 30005, "type": 30003, "id": 30011, "help": 30013,
-            "role": 30101, "value": 30045, "legacy_value": 30093, "selected": 30079,
+            "role": 30101, "value": 30045, "legacy_value": 30093, "selected": 30079, "offscreen": 30022,
         }
         for prop in props.values():
             request.AddProperty(prop)
@@ -252,7 +267,7 @@ class BrowserAccessibility:
             raw = value(element, key)
             return raw if isinstance(raw, str) else ""
 
-        def visit(element, depth=0):
+        def visit(element, depth=0, ancestors=()):
             nonlocal count, truncated
             count += 1
             if count > self.node_limit or depth > 90:
@@ -270,11 +285,13 @@ class BrowserAccessibility:
             if isinstance(selected, (bool, int)):
                 node.selected = bool(selected)
             self._controls[token] = self._auto.Control(element=element)
+            self._ancestors[token] = ancestors
+            self._offscreen[token] = value(element, "offscreen") is True
             try:
                 children = element.GetCachedChildren()
                 if children:
                     for index in range(children.Length):
-                        node.children.append(visit(children.GetElement(index), depth + 1))
+                        node.children.append(visit(children.GetElement(index), depth + 1, ancestors + (token,)))
             except Exception:
                 truncated = True
             return node
@@ -296,6 +313,16 @@ class BrowserAccessibility:
         result = snapshot_from_tree(document, not truncated,
                                     "浏览器文档树读取被截断" if truncated else "")
         result.diagnostics = diagnostics
+        tab_candidates = []
+        def inspect_tabs(node, parents=()):
+            if re.fullmatch(r"\d*\s*(?:视频|章节测验)", node.label):
+                tab_candidates.append({"label": node.label, "id": node.automation_id, "role": node.role,
+                                       "parents": list(parents[-5:])})
+            label = node.label.split("?")[0][:60]
+            for child in node.children:
+                inspect_tabs(child, parents + (f"{node.automation_id}|{node.role}|{label}",))
+        inspect_tabs(document)
+        diagnostics["task_tabs"] = tab_candidates[:30]
         if not result.complete:
             self._controls.clear()
         return result
@@ -373,27 +400,49 @@ class BrowserAccessibility:
             return CourseSnapshot("", complete=False, problem=f"整页可访问性读取失败：{type(exc).__name__}")
 
     def activate(self, token: str, click) -> None:
-        """仅使用最近一次快照的元素，先滚到可见，再调用原生按钮动作。"""
+        """原生语义操作不依赖屏幕坐标；只有坐标回退才要求滚到可见。"""
         control = self._controls.get(token)
         if control is None or not token.startswith(f"{self._generation}:"):
-            raise RuntimeError("操作目标已过期，需要重新扫描")
+            raise AccessibilityActionError("操作目标已过期，需要重新扫描")
+        self.last_action = ""
+        try:
+            self._activate_control(token, control, click)
+        except Exception as exc:
+            self._controls.clear()
+            if isinstance(exc, AccessibilityActionError):
+                raise
+            raise AccessibilityActionError(f"浏览器控件已变化，重新定位（{type(exc).__name__}）") from exc
+
+    def _activate_control(self, token, control, click):
         auto = self._auto
-        scroll = control.GetPattern(auto.PatternId.ScrollItemPattern)
-        if scroll:
-            scroll.ScrollIntoView(waitTime=0.1)
-        if control.IsOffscreen:
-            control.SetFocus()
-        if control.IsOffscreen:
-            raise RuntimeError("操作目标仍在屏幕外，不能使用旧坐标点击")
         invoke = control.GetPattern(auto.PatternId.InvokePattern)
         if invoke:
             if not invoke.Invoke(waitTime=0.1):
-                raise RuntimeError("浏览器未接受按钮操作")
+                raise AccessibilityActionError("浏览器未确认按钮操作，先复核当前播放状态")
+            self.last_action = "UIA Invoke" + ("（屏幕外控件）" if self._offscreen.get(token) else "")
             return
+        legacy_id = getattr(auto.PatternId, "LegacyIAccessiblePattern", None)
+        legacy = control.GetPattern(legacy_id) if legacy_id is not None else None
+        if legacy and legacy.DefaultAction:
+            if not legacy.DoDefaultAction(waitTime=0.1):
+                raise AccessibilityActionError("浏览器未确认默认动作，先重新读取页面")
+            self.last_action = "UIA 默认动作"
+            return
+        # 嵌套 iframe 中仅滚动按钮不一定能移动外层正文，按外到内依次滚动祖先。
+        for ancestor in self._ancestors.get(token, ()) + (token,):
+            target = self._controls.get(ancestor)
+            scroll = target.GetPattern(auto.PatternId.ScrollItemPattern) if target else None
+            if scroll:
+                scroll.ScrollIntoView(waitTime=0.1)
+        if control.IsOffscreen:
+            control.SetFocus()
+        if control.IsOffscreen:
+            raise AccessibilityActionError("目标尚未滚到可见区域，重新定位后再操作")
         rect = control.BoundingRectangle
         if control.IsOffscreen:
-            raise RuntimeError("操作目标仍在屏幕外，不能使用旧坐标点击")
+            raise AccessibilityActionError("滚动后目标位置改变，需要重新定位")
         x, y = int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2)
         if rect.right <= rect.left or rect.bottom <= rect.top or not self.window.contains(x, y):
-            raise RuntimeError("按钮未处于目标窗口可见区域")
+            raise AccessibilityActionError("按钮未处于目标窗口可见区域")
         click(x, y, "整页任务清单定位的控件")
+        self.last_action = "重新定位后点击"

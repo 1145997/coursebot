@@ -83,6 +83,15 @@ class WholePageInventoryTests(unittest.TestCase):
         snapshot = snapshot_from_tree(page(Node(name="3 章节测验", token="real-tab", role="option")))
         self.assertEqual(snapshot.quiz_tab_token, "real-tab")
 
+    def test_actual_listitem_tabs_are_found_only_inside_the_content_tab_bar(self):
+        tree = page(Node(automation_id="prev_tab", children=[
+            Node(name="视频", automation_id="dct1", role="listitem", token="video-tab"),
+            Node(name="章节测验", automation_id="dct2", role="listitem", token="quiz-tab")]),
+            Node(name="章节测验", role="listitem", token="sidebar-quiz"))
+        snapshot = snapshot_from_tree(tree)
+        self.assertEqual(snapshot.quiz_tab_token, "quiz-tab")
+        self.assertEqual(snapshot.video_tab_token, "video-tab")
+
     def test_popup_quiz_is_not_treated_as_an_ordinary_pause(self):
         p = player(1)
         p.children += [Node(name="判断题"), button("提交", "submit")]

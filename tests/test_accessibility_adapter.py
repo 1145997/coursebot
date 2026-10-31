@@ -3,7 +3,7 @@ import types
 import unittest
 from unittest.mock import Mock
 
-from coursebot.accessibility import AccessibleNode, BrowserAccessibility, select_course_document
+from coursebot.accessibility import AccessibleNode, AccessibilityActionError, BrowserAccessibility, select_course_document
 from coursebot.windows import WindowInfo
 
 
@@ -146,17 +146,57 @@ class AccessibilityAdapterTests(unittest.TestCase):
         invoke.Invoke.assert_called_once()
         click.assert_not_called()
 
-    def test_offscreen_target_is_focused_before_native_action(self):
+    def test_offscreen_target_is_invoked_without_guessing_or_requiring_focus(self):
         doc = document()
         play = doc.children[1].children[0]
         play.IsOffscreen = True
+        play.SetFocus = Mock(side_effect=RuntimeError("cannot focus iframe"))
         invoke = Mock()
         invoke.Invoke.return_value = True
         play.patterns[6] = invoke
         r = reader(doc)
-        r.activate(r.read().videos[0].play_token, Mock())
-        self.assertFalse(play.IsOffscreen)
+        click = Mock()
+        r.activate(r.read().videos[0].play_token, click)
+        play.SetFocus.assert_not_called()
+        click.assert_not_called()
         invoke.Invoke.assert_called_once()
+
+    def test_failed_native_invoke_does_not_click_coordinates_or_reuse_tokens(self):
+        doc = document()
+        invoke = Mock()
+        invoke.Invoke.side_effect = OSError("stale COM provider")
+        doc.children[1].children[0].patterns[6] = invoke
+        r = reader(doc)
+        click = Mock()
+        with self.assertRaises(AccessibilityActionError):
+            r.activate(r.read().videos[0].play_token, click)
+        click.assert_not_called()
+        self.assertEqual(r._controls, {})
+
+    def test_offscreen_default_action_does_not_require_coordinates(self):
+        doc = document()
+        play = doc.children[1].children[0]
+        play.IsOffscreen = True
+        legacy = Mock(DefaultAction="click")
+        legacy.DoDefaultAction.return_value = True
+        play.patterns[8] = legacy
+        r = reader(doc)
+        r._auto.PatternId.LegacyIAccessiblePattern = 8
+        click = Mock()
+        r.activate(r.read().videos[0].play_token, click)
+        legacy.DoDefaultAction.assert_called_once()
+        click.assert_not_called()
+
+    def test_offscreen_without_semantic_action_never_uses_old_coordinates(self):
+        doc = document()
+        play = doc.children[1].children[0]
+        play.IsOffscreen = True
+        play.SetFocus = Mock()
+        r = reader(doc)
+        click = Mock()
+        with self.assertRaises(AccessibilityActionError):
+            r.activate(r.read().videos[0].play_token, click)
+        click.assert_not_called()
 
     def test_missing_course_document_never_returns_a_video_inventory(self):
         r = reader(FakeControl("another page", "DocumentControl"))

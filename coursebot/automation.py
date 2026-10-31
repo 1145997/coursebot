@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from .capture import Frame, ScreenCapture
-from .accessibility import BrowserAccessibility
+from .accessibility import AccessibilityActionError, BrowserAccessibility
 from .course_state import Action, CourseController, CourseSnapshot
 from .config import LOG_DIR, Settings, masked_key
 from .llm import LLMClient, LLMError
@@ -132,6 +132,11 @@ class AutomationWorker(threading.Thread):
         self._incomplete_snapshot_since = None
         self._last_live_inventory_save = 0.0
         self._last_accessible_progress_log = 0.0
+        self._action_failures = {}
+        self._body_signature = None
+        self._body_seen_at = 0.0
+        self._body_changed_at = 0.0
+        self._pending_writeback_at = None
 
     # ------------------------------------------------------------------ 基础
     def _setup_logging(self) -> None:
@@ -942,6 +947,19 @@ class AutomationWorker(threading.Thread):
             temporary = LOG_DIR / "live_inventory.tmp"
             temporary.write_text(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(LOG_DIR / "live_inventory.json")
+        signature = (snapshot.page_key, snapshot.page_kind, len(snapshot.videos),
+                     bool(snapshot.video_tab_token), bool(snapshot.quiz_tab_token))
+        if signature != self._body_signature:
+            if self._body_signature is None or signature[0] != self._body_signature[0]:
+                self._body_seen_at = now
+                self._pending_writeback_at = None
+                self._action_failures.clear()
+            self._body_signature = signature
+            self._body_changed_at = now
+        if now - self._body_seen_at < 3 or now - self._body_changed_at < 1:
+            self.time_reading = None
+            self._status("scanning", "复核章节正文和整页播放器清单", duration=0)
+            return True
         if snapshot.complete and snapshot.popup_quiz:
             frame = self._grab()
             view = self._scan(frame, track_time=False)
@@ -979,7 +997,8 @@ class AutomationWorker(threading.Thread):
             self._stop_reason = "整页盘点试运行完成（未执行输入）"
             raise StopAutomation()
         if decision.action in {Action.PLAY, Action.OPEN_VIDEO_TAB, Action.PAUSE_COMPLETED}:
-            self._browser_reader.activate(decision.token, self._click_screen)
+            if not self._activate_accessible(decision.token, decision.video_key or decision.reason):
+                return True
             self._course_controller.acted(decision, time.monotonic())
             self._log(decision.reason)
             return True
@@ -1001,12 +1020,39 @@ class AutomationWorker(threading.Thread):
             chapter_id = snapshot.page_key.split(":")[-1].split("@")[0]
             current_pending = any(row.key == f"cur{chapter_id}" for row in snapshot.pending)
             if snapshot.quiz_tab_token and current_pending and not self._chapter_quiz_done:
-                self._browser_reader.activate(snapshot.quiz_tab_token, self._click_screen)
+                if not self._activate_accessible(snapshot.quiz_tab_token, "当前章节测验"):
+                    return True
                 self._log("整页视频已完成，进入本节章节测验")
                 self._sleep(1)
                 return True
+            if current_pending and not self._chapter_quiz_done:
+                if self._pending_writeback_at is None:
+                    self._pending_writeback_at = now
+                if now - self._pending_writeback_at > 30:
+                    raise NavigationFailed("视频任务点已完成，但本节目录仍有待办，尚未确认其他任务入口")
+                self.time_reading = None
+                self._status("scanning", "等待本节目录完成状态同步，暂不跳节", duration=0)
+                return True
+            self._pending_writeback_at = None
             return self._open_accessible_pending(snapshot)
         return False
+
+    def _activate_accessible(self, token: str, identity: str) -> bool:
+        """失败后只重新观察，不在旧控件上重复切换播放或重复导航。"""
+        try:
+            self._browser_reader.activate(token, self._click_screen)
+        except AccessibilityActionError as exc:
+            count = self._action_failures.get(identity, 0) + 1
+            self._action_failures[identity] = count
+            if count >= 3:
+                raise NavigationFailed(f"重新定位 3 次仍无法操作：{exc}") from exc
+            self._log(f"控件变化，重新读取后复核（{count}/3）：{exc}", "warning")
+            self._status("scanning", "重新定位浏览器控件，等待下一次整页复核", duration=0)
+            self._sleep(0.5)
+            return False
+        self._action_failures.pop(identity, None)
+        self._log(f"控件操作：{self._browser_reader.last_action}")
+        return True
 
     def _handle_accessible_nonvideo(self, snapshot: CourseSnapshot) -> bool:
         frame = self._grab()
@@ -1030,6 +1076,9 @@ class AutomationWorker(threading.Thread):
         raise NavigationFailed("已确认非视频页面，但未识别到相应操作入口；未执行播放点击")
 
     def _open_accessible_pending(self, snapshot: CourseSnapshot) -> bool:
+        if not snapshot.complete or not snapshot.page_key:
+            self._status("scanning", "等待完整目录后再选择待办", duration=0)
+            return True
         if self.settings.dry_run:
             self._stop_reason = "试运行不切换橙色目录"
             raise StopAutomation()
@@ -1044,16 +1093,19 @@ class AutomationWorker(threading.Thread):
             self._stop_reason = "整页目录未发现橙色待办"
             raise StopAutomation()
         target = pending[0]
-        self._browser_reader.activate(target.token, self._click_screen)
+        if not self._activate_accessible(target.token, target.key):
+            return True
         self._chapter_quiz_done = False
         self._reset_video_tracking()
-        self._log(f"本节已完成，进入橙色待办：{target.title}")
-        for _ in range(3):
+        self._log(f"已选择橙色待办，等待正文：{target.title}")
+        for _ in range(15):
             self._sleep(0.8)
             check = self._browser_reader.read()
-            if check.complete and check.page_key and check.page_key != snapshot.page_key:
+            if (check.complete and check.page_key and
+                    check.page_key.split(":")[-1].split("@")[0] == target.key.removeprefix("cur")):
                 self.sections_finished += 1
                 self._emit("stats", sections=self.sections_finished, quizzes=self.quizzes_solved)
+                self._log(f"进入橙色待办：{target.title}；重新盘点正文")
                 return True
         raise NavigationFailed("已操作橙色目录，但未确认章节切换，停止重复点击")
 

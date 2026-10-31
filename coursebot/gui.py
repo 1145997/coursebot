@@ -403,7 +403,7 @@ class CourseBotApp:
         self.stats_text = self.label(row2, "本次完成 0 节 · 自动答题 0 题", font=self.font_small, fg=MUTED)
         self.stats_text.grid(row=0, column=0, sticky="w")
         self.quiz_short = self.label(row2, "", font=self.font_tiny, fg=PURPLE)
-        self.quiz_short.grid(row=0, column=1, sticky="e")
+        self.quiz_short.grid(row=1, column=0, sticky="w", pady=(self.px(3), 0))
 
         # 右侧设置
         right = self.card(body)
@@ -1158,6 +1158,8 @@ class CourseBotApp:
             pass
         self.stop_event = threading.Event()
         self._last_error_reason = ""
+        self.quiz_short.configure(text="")
+        self.stats_text.configure(text="本次完成 0 节 · 自动答题 0 题")
         self.stop_btn.configure(state="normal", bg="#3a1720")
         self.start_btn.configure(state="disabled", bg="#244b36", text="运行中…")
         self.running = True
@@ -1215,6 +1217,7 @@ class CourseBotApp:
         self.start_btn.configure(state="normal", bg=ACCENT, text="开始自动学习")
         self.stop_btn.configure(state="disabled", text="停止  F8")
         self.header_status.configure(text="已停止" if "出错" not in reason else "异常停止", fg=MUTED)
+        self.state_text.configure(text="已停止" if "出错" not in reason else "异常停止")
         self.status_dot.configure(fg=MUTED)
         try:
             self.root.deiconify()
@@ -1299,7 +1302,7 @@ class CourseBotApp:
         elif kind == "quiz_answer":
             ans = ",".join(msg.get("answer") or [])
             reason = str(msg.get("reason") or "")[:80]
-            self.quiz_short.configure(text=f"LLM: {ans} {reason}")
+            self.quiz_short.configure(text=f"最近答题：{ans[:40]}（解析见运行日志）")
             self._append_log("info", f"LLM 答案 {ans}；{reason}")
         elif kind == "local_models":
             if msg.get("ok"):
