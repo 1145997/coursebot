@@ -137,6 +137,8 @@ class AutomationWorker(threading.Thread):
         self._body_seen_at = 0.0
         self._body_changed_at = 0.0
         self._pending_writeback_at = None
+        self._last_popup_probe_at = 0.0
+        self._popup_unreadable_since = None
 
     # ------------------------------------------------------------------ 基础
     def _setup_logging(self) -> None:
@@ -960,13 +962,16 @@ class AutomationWorker(threading.Thread):
             self.time_reading = None
             self._status("scanning", "复核章节正文和整页播放器清单", duration=0)
             return True
-        if snapshot.complete and snapshot.popup_quiz:
-            frame = self._grab()
-            view = self._scan(frame, track_time=False)
-            if not view.quiz.detected:
-                raise NavigationFailed("播放器出现弹题，但题面未识别完整，停止播放点击")
-            self._handle_quiz(view, frame)
+        previous_probe = self._last_popup_probe_at
+        if self._probe_accessible_popup(snapshot, now):
             return True
+        if self._last_popup_probe_at != previous_probe:
+            # OCR 期间播放器可能已自行恢复、弹出题目或切换正文；输入前刷新 UIA。
+            snapshot = self._browser_reader.read()
+            if (not snapshot.complete or snapshot.page_key != signature[0] or snapshot.popup_quiz
+                    or len(snapshot.videos) != signature[2]):
+                return True
+            now = time.monotonic()
         if snapshot.page_key != self._course_controller.page_key:
             self._reset_video_tracking()
             self._video_retry_count = 0
@@ -1035,6 +1040,33 @@ class AutomationWorker(threading.Thread):
                 return True
             self._pending_writeback_at = None
             return self._open_accessible_pending(snapshot)
+        return False
+
+    def _probe_accessible_popup(self, snapshot: CourseSnapshot, now: float) -> bool:
+        """视频弹层未必暴露到 UIA；定期独立 OCR 检查，不依赖 popup_quiz 标记。"""
+        if not snapshot.videos and not snapshot.popup_quiz:
+            return False
+        if not snapshot.popup_quiz and now - self._last_popup_probe_at < 5:
+            return False
+        self._last_popup_probe_at = now
+        frame = self._grab()
+        view = self._scan(frame, track_time=False)
+        self._last_popup_probe_at = time.monotonic()
+        if view.quiz.detected:
+            self._popup_unreadable_since = None
+            source = "整页提示 + OCR" if snapshot.popup_quiz else "独立 OCR 巡检"
+            self._log(f"视频弹题已识别（{source}）：{view.quiz.kind}；{len(view.quiz.options)} 个选项")
+            self._handle_quiz(view, frame)
+            return True
+        if snapshot.popup_quiz:
+            if self._popup_unreadable_since is None:
+                self._popup_unreadable_since = now
+            if now - self._popup_unreadable_since > 20:
+                raise NavigationFailed("播放器弹题尚未识别完整，已停止播放输入")
+            self.time_reading = None
+            self._status("quiz", "等待视频弹题题面完整，暂不点击播放", duration=0)
+            return True
+        self._popup_unreadable_since = None
         return False
 
     def _activate_accessible(self, token: str, identity: str) -> bool:

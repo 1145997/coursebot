@@ -98,6 +98,12 @@ class WholePageInventoryTests(unittest.TestCase):
         snapshot = snapshot_from_tree(page(Node(name="任务点未完成", token="task1"), p))
         self.assertTrue(snapshot.popup_quiz)
 
+    def test_popup_submit_div_does_not_need_a_native_button_role(self):
+        p = player(1)
+        p.children += [Node(name="判断题"), Node(name="提交", role="generic")]
+        snapshot = snapshot_from_tree(page(Node(name="任务点未完成", token="task1"), p))
+        self.assertTrue(snapshot.popup_quiz)
+
     def test_nested_video_document_is_counted_without_a_region_label(self):
         doc = Node(kind="DocumentControl", value="https://mooc1.chaoxing.com/ananas/modules/video/index.html", children=[button()])
         self.assertEqual(len(snapshot_from_tree(page(Node(name="任务点未完成", token="task1"), doc)).videos), 1)

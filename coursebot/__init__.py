@@ -1,3 +1,3 @@
 """网课自动学习助手 —— OpenCV + OCR + Tkinter."""
 
-__version__ = "2.0.0-dev.1"
+__version__ = "2.0.0-dev.2"

@@ -1,4 +1,4 @@
-# 网课自动学习助手（CourseBot）v2.0.0-dev.1
+# 网课自动学习助手（CourseBot）v2.0.0-dev.2
 
 > 本地测试版，未推送远程。整页视频及目录切换已有 Windows 实页验证，详细范围见 docs/VALIDATION.md。
 
@@ -44,7 +44,7 @@ Windows 桌面端网课自动化工具：
 
 ## 3. 发布版使用
 
-1. 本地修复包为 `CourseBot-v2.0.0-dev.1-win64.zip`；旧基线另存，均未发布到 GitHub。解压完整目录；
+1. 本地修复包为 `CourseBot-v2.0.0-dev.2-win64.zip`；旧基线另存，均未发布到 GitHub。解压完整目录；
 2. 必须保留 `CourseBot.exe` 和 `_internal` 文件夹在同一目录；
 3. 双击 `CourseBot.exe`；
 4. 首次运行会在 exe 同级生成：

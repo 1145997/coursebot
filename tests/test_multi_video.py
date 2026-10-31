@@ -44,6 +44,7 @@ def worker():
     result._sleep = Mock()
     result._click_screen = Mock()
     result._ensure_foreground = Mock(return_value=True)
+    result._probe_accessible_popup = Mock(return_value=False)
     result.clicker = Mock()
     return result
 

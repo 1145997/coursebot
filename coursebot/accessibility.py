@@ -135,8 +135,9 @@ def snapshot_from_tree(root: AccessibleNode, complete: bool = True, problem: str
         raw = " ".join(texts).replace("当前时间", "").replace("时长", "")
         parsed = parse_time_text(raw)
         buttons = [item for item in inside if item.kind == "ButtonControl" or item.role == "button"]
-        if (any(kind in raw for kind in ("判断题", "单选题", "多选题")) and
-                any(item.label in {"提交", "提交答案"} for item in buttons)):
+        # 超星弹题的“提交”可能是 div/span，不能要求它具有原生 Button 角色。
+        if (any(kind in raw for kind in ("判断题", "单选题", "多选题", "不定项选择题")) and
+                any(item.label.strip() in {"提交", "提交答案"} for item in inside)):
             snapshot.popup_quiz = True
         pause = next((item for item in buttons if item.label in {"暂停", "暂停视频", "Pause"}), None)
         play = next((item for item in buttons if item.label in {"播放视频", "播放", "Play"}), None)
