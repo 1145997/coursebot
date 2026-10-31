@@ -73,6 +73,23 @@ def page_identity(root: AccessibleNode) -> str:
     return f"{base}@{card}" if base and card else base
 
 
+def select_course_document(root: AccessibleNode) -> AccessibleNode | None:
+    """优先识别课程 URL，不依赖浏览器为文档设置的精确标题。"""
+    documents = [node for node in root.walk() if node.kind == "DocumentControl"]
+    for node in documents:
+        for value in (node.value, node.name, node.help):
+            parsed = urlparse(value)
+            if "/studentstudy" in parsed.path and page_identity(AccessibleNode(kind="DocumentControl", value=value)):
+                return node
+    for node in documents:
+        if "学生学习页面" in node.label and page_identity(node):
+            return node
+    for node in documents:
+        if page_identity(node) and any(child.automation_id.startswith("cur") for child in node.walk()):
+            return node
+    return None
+
+
 def snapshot_from_tree(root: AccessibleNode, complete: bool = True, problem: str = "") -> CourseSnapshot:
     snapshot = CourseSnapshot(page_identity(root), complete=complete, problem=problem)
     if not snapshot.page_key:
@@ -139,12 +156,14 @@ def snapshot_from_tree(root: AccessibleNode, complete: bool = True, problem: str
             names = [item.label.strip() for item in children if item.label.strip()]
             # 橙色数字是该目录行的未完成任务数，只用于确认有待办。
             # 不能据此判断它是视频、测验还是阅读。
-            if not any(re.fullmatch(r"\d+", name) for name in names):
+            if not any(re.fullmatch(r"\d+", name) and int(name) > 0 for name in names):
                 continue
             title_node = next((item for item in children if item.label and
                                not re.fullmatch(r"[\d.\s]+", item.label)), None)
             if title_node:
-                snapshot.pending.append(PendingChapter(node.automation_id, " ".join(names), title_node.token))
+                number = next((name for name in names if re.fullmatch(r"\d+(?:\.\d+)+", name)), "")
+                title = f"{number} {title_node.label}".strip()
+                snapshot.pending.append(PendingChapter(node.automation_id, title, title_node.token))
     if not snapshot.videos:
         video_tab = next((node for node in ordered if node.role in {"option", "tab"} and
                           re.fullmatch(r"\d*\s*视频", node.label) and node.token), None)
@@ -155,6 +174,18 @@ def snapshot_from_tree(root: AccessibleNode, complete: bool = True, problem: str
                      re.fullmatch(r"\d*\s*章节测验", node.label) and node.token), None)
     if quiz_tab:
         snapshot.quiz_tab_token = quiz_tab.token
+    main = next((node for node in ordered if node.automation_id == "mainid"), root)
+    main_nodes = list(main.walk())
+    text = " ".join(node.label for node in main_nodes)
+    if snapshot.videos:
+        snapshot.page_kind = "video"
+    elif any(cue in text for cue in ("暂无内容", "暂无课程内容", "暂无学习内容", "暂无资源")):
+        snapshot.page_kind = "empty"
+    elif any(cue in text for cue in ("本章学习目标", "通过本章", "你需要掌握")):
+        snapshot.page_kind = "intro"
+    elif ("题量" in text or any(node.label in {"开始答题", "重新答题"} for node in main_nodes)
+          or ("章节测验" in text and any(cue in text for cue in ("得分", "成绩", "已提交")))):
+        snapshot.page_kind = "quiz"
     return snapshot
 
 
@@ -167,9 +198,12 @@ class BrowserAccessibility:
         self._initializer = None
         self._controls = {}
         self._generation = 0
+        self._native = None
+        self.last_tree: AccessibleNode | None = None
 
     def close(self):
         self._controls.clear()
+        self._native = None
         if self._initializer:
             self._initializer.Uninitialize()
             self._initializer = None
@@ -179,10 +213,98 @@ class BrowserAccessibility:
             import uiautomation as auto
             self._auto = auto
             self._initializer = auto.UIAutomationInitializerInThread()
+            # 每个使用线程持有自己的 COM 客户端，不跨 GUI/工作线程共享控件。
+            import comtypes.client
+            typelib = comtypes.client.GetModule("UIAutomationCore.dll")
+            self._native = comtypes.client.CreateObject(
+                "{ff48dba4-60ef-4201-aa87-54103eef594e}", interface=typelib.IUIAutomation
+            )
+
+    def _read_cached(self) -> CourseSnapshot:
+        """批量抓取原生树缓存，避开逐属性跨进程遍历浏览器标签栏。"""
+        started = time.monotonic()
+        self._generation += 1
+        self._controls.clear()
+        self.last_tree = None
+        client = self._native
+        request = client.CreateCacheRequest()
+        request.TreeScope = 7  # Element | Children | Descendants
+        request.TreeFilter = client.RawViewCondition
+        request.AutomationElementMode = 1  # Full: 保留对最近快照控件的实际操作能力
+        props = {
+            "name": 30005, "type": 30003, "id": 30011, "help": 30013,
+            "role": 30101, "value": 30045, "legacy_value": 30093, "selected": 30079,
+        }
+        for prop in props.values():
+            request.AddProperty(prop)
+        root_element = client.ElementFromHandle(self.window.hwnd)
+        cached = root_element.BuildUpdatedCache(request)
+        count = 0
+        truncated = False
+
+        def value(element, key):
+            try:
+                return element.GetCachedPropertyValue(props[key])
+            except Exception:
+                return None
+
+        def string(element, key):
+            raw = value(element, key)
+            return raw if isinstance(raw, str) else ""
+
+        def visit(element, depth=0):
+            nonlocal count, truncated
+            count += 1
+            if count > self.node_limit or depth > 90:
+                truncated = True
+                return AccessibleNode()
+            kind = {50030: "DocumentControl", 50000: "ButtonControl"}.get(value(element, "type"), "")
+            token = f"{self._generation}:{count}"
+            url = string(element, "value") or string(element, "legacy_value")
+            node = AccessibleNode(
+                name=string(element, "name"), help=string(element, "help"),
+                automation_id=string(element, "id"), role=string(element, "role"),
+                kind=kind, value=url, token=token,
+            )
+            selected = value(element, "selected")
+            if isinstance(selected, (bool, int)):
+                node.selected = bool(selected)
+            self._controls[token] = self._auto.Control(element=element)
+            try:
+                children = element.GetCachedChildren()
+                if children:
+                    for index in range(children.Length):
+                        node.children.append(visit(children.GetElement(index), depth + 1))
+            except Exception:
+                truncated = True
+            return node
+
+        tree = visit(cached)
+        documents = [node for node in tree.walk() if node.kind == "DocumentControl"]
+        diagnostics = {
+            "strategy": "native-cache", "nodes": count, "documents": len(documents),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "document_titles": [node.name.split("?")[0][:100] for node in documents[:10]],
+        }
+        document = select_course_document(tree)
+        if document is None:
+            self._controls.clear()
+            return CourseSnapshot("", complete=False,
+                                  problem="浏览器未提供可识别的课程正文；已记录文档树诊断",
+                                  diagnostics=diagnostics)
+        self.last_tree = document
+        result = snapshot_from_tree(document, not truncated,
+                                    "浏览器文档树读取被截断" if truncated else "")
+        result.diagnostics = diagnostics
+        if not result.complete:
+            self._controls.clear()
+        return result
 
     def read(self) -> CourseSnapshot:
         try:
             self._open()
+            if self._native is not None:
+                return self._read_cached()
             root = self._auto.ControlFromHandle(self.window.hwnd)
             if root is None:
                 return CourseSnapshot("", complete=False, problem="目标浏览器窗口已失效")

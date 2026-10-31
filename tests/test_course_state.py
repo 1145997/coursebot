@@ -60,6 +60,15 @@ class WholePageInventoryTests(unittest.TestCase):
         self.assertEqual(len(snapshot.videos), 0)
         self.assertEqual(snapshot.pending[0].token, "chapter-link")
 
+    def test_zero_remaining_tasks_is_not_a_pending_chapter(self):
+        row = Node(automation_id="cur123", children=[Node(name="11.1"), Node(name="问卷调查"), Node(name="0")])
+        self.assertEqual(snapshot_from_tree(page(row)).pending, [])
+
+    def test_sidebar_title_is_not_duplicated_by_nested_text_nodes(self):
+        row = Node(automation_id="cur123", children=[Node(name="3.2"), Node(name="大学生常见情绪困扰", token="link",
+                   children=[Node(name="大学生常见情绪困扰")]), Node(name="1")])
+        self.assertEqual(snapshot_from_tree(page(row)).pending[0].title, "3.2 大学生常见情绪困扰")
+
     def test_complete_tree_is_required(self):
         s = snapshot_from_tree(page(Node(name="任务点未完成", token="task1"), player(1)), complete=False, problem="truncated")
         self.assertEqual(CourseController().decide(s, 0).action, Action.STOP)
@@ -162,7 +171,15 @@ class SinglePlaybackControllerTests(unittest.TestCase):
         self.assertEqual(self.decide(video(current=500), now=60).action, Action.WAIT)
 
     def test_empty_nonvideo_page_uses_existing_quiz_flow(self):
-        self.assertEqual(self.decide().action, Action.LEGACY_PAGE)
+        self.assertEqual(self.controller.decide(CourseSnapshot("chapter", page_kind="quiz"), 0).action, Action.LEGACY_PAGE)
+
+    def test_navigation_loading_gap_never_enters_legacy_playback(self):
+        self.assertEqual(self.decide(now=0).action, Action.WAIT)
+        self.assertEqual(self.decide(now=21).action, Action.STOP)
+
+    def test_current_quiz_does_not_switch_back_to_video_tab(self):
+        snapshot = CourseSnapshot("chapter", page_kind="quiz", video_tab_token="video-tab")
+        self.assertEqual(self.controller.decide(snapshot, 0).action, Action.LEGACY_PAGE)
 
     def test_error_on_later_video_does_not_interrupt_current_video(self):
         later = CourseVideo("2", 2, False, play_token="play2", error_text="视频加载失败")

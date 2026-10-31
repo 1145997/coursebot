@@ -1084,12 +1084,12 @@ class CourseBotApp:
             if view.current_idx is not None and view.sections:
                 cur = view.sections[view.current_idx].display
             log("success", f"预览完成：时间 {t}；当前小节 {cur}；目录 {len(view.sections)} 项；页面标题 {title}")
-            pending = [r for r in view.sections if r.pending_tasks == 1 and not r.completed]
+            pending = inventory.pending if inventory.complete else []
             if pending:
                 log(
                     "warning",
-                    "发现待补章节测验："
-                    + "、".join(f"{r.number} {r.title}" for r in pending[:6]),
+                    "目录待办（进入后识别类型）："
+                    + "、".join(r.title for r in pending[:6]),
                 )
             if view.quiz.detected:
                 log("warning", f"检测到题目：{view.quiz.kind}，{len(view.quiz.options)} 个选项")

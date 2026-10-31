@@ -13,6 +13,7 @@ from coursebot.config import Settings
 from coursebot.ocr import OcrLine
 from coursebot.vision import PageView, SectionRow, TimeReading, VideoTask, analyze_page, parse_time_text
 from coursebot.windows import WindowInfo
+from coursebot.course_state import CourseSnapshot
 
 
 def line(text, y, x=130):
@@ -215,6 +216,17 @@ class VideoNavigationTests(unittest.TestCase):
         with self.assertRaises(StopAutomation):
             w._try_next_video_on_page(self.frame)
         w.clicker.scroll.assert_not_called()
+        w._click_screen.assert_not_called()
+
+    def test_accessibility_loading_gap_does_not_call_old_playback(self):
+        w = self.worker
+        w.settings.save_debug_frames = False
+        w._browser_reader = Mock()
+        w._handle_accessible_nonvideo = Mock()
+        w._scan = Mock()
+        self.assertTrue(w._accessible_video_tick(CourseSnapshot("course:newchapter")))
+        w._handle_accessible_nonvideo.assert_not_called()
+        w._scan.assert_not_called()
         w._click_screen.assert_not_called()
 
 

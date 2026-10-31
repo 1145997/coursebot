@@ -35,6 +35,8 @@ class CourseSnapshot:
     quiz_tab_token: str = ""
     popup_quiz: bool = False
     video_tab_selected: bool | None = None
+    diagnostics: dict = field(default_factory=dict)
+    page_kind: str = "unknown"
 
     def inventory_text(self) -> str:
         done = [str(v.order) for v in self.videos if v.completed is True]
@@ -94,6 +96,8 @@ class CourseController:
             self.tab_attempts = 0
             self.pause_requests.clear()
         if not snapshot.videos:
+            if snapshot.page_kind in {"quiz", "empty"}:
+                return Decision(Action.LEGACY_PAGE, "处理当前测验或空内容页")
             if snapshot.video_tab_token:
                 if snapshot.video_tab_selected:
                     if now - self.page_seen_at > 30:
@@ -104,7 +108,11 @@ class CourseController:
                 if self.tab_attempts >= 2:
                     return Decision(Action.STOP, "两次操作后视频标签仍未加载，停止重复点击")
                 return Decision(Action.OPEN_VIDEO_TAB, "进入视频标签后重新盘点", snapshot.video_tab_token)
-            return Decision(Action.LEGACY_PAGE, "当前不是视频页，交给测验/导读流程")
+            if snapshot.page_kind in {"quiz", "intro", "empty", "other"}:
+                return Decision(Action.LEGACY_PAGE, "已确认非视频内容，交给测验/导读流程")
+            if now - self.page_seen_at > 20:
+                return Decision(Action.STOP, "页面正文未完整加载，未确认任务类型，停止输入")
+            return Decision(Action.WAIT, "等待章节正文和播放器加载完整")
         if any(video.completed is None for video in snapshot.videos):
             return Decision(Action.STOP, "有播放器无法关联任务点状态，停止操作以免重播或漏播")
         pending = [video for video in snapshot.videos if video.completed is False]

@@ -3,7 +3,7 @@ import types
 import unittest
 from unittest.mock import Mock
 
-from coursebot.accessibility import BrowserAccessibility
+from coursebot.accessibility import AccessibleNode, BrowserAccessibility, select_course_document
 from coursebot.windows import WindowInfo
 
 
@@ -52,7 +52,68 @@ def reader(doc=None, node_limit=6000):
     return r
 
 
+class CachedElement:
+    """只提供缓存读取接口，防止新实现退回逐属性跨进程读取。"""
+    def __init__(self, control):
+        self.control = control
+        self.children = [CachedElement(child) for child in control.children]
+
+    def GetCachedPropertyValue(self, prop):
+        return {30005: self.control.Name, 30003: {"DocumentControl": 50030, "ButtonControl": 50000}.get(self.control.ControlTypeName, 50033),
+                30011: self.control.AutomationId, 30013: self.control.HelpText, 30045: self.control.url}.get(prop, "")
+
+    def GetCachedChildren(self):
+        return types.SimpleNamespace(Length=len(self.children), GetElement=self.children.__getitem__)
+
+
+def cached_reader(node_limit=6000):
+    r = reader(node_limit=node_limit)
+    doc = document()
+    doc.Name = ""  # 浏览器不保证课程文档有标题。
+    doc.children[-1].children[0].IsOffscreen = True
+    cached = CachedElement(FakeControl("29 browser tabs", children=[FakeControl("tab") for _ in range(29)] + [doc]))
+    request = types.SimpleNamespace(AddProperty=Mock())
+    live_root = types.SimpleNamespace(BuildUpdatedCache=Mock(return_value=cached))
+    r._native = types.SimpleNamespace(CreateCacheRequest=Mock(return_value=request), RawViewCondition=object(),
+                                      ElementFromHandle=Mock(return_value=live_root))
+    r._auto.Control = lambda element: element.control
+    return r, request, live_root
+
+
 class AccessibilityAdapterTests(unittest.TestCase):
+    def test_native_cache_fetches_subtree_once_and_reads_all_three_players(self):
+        r, request, live_root = cached_reader()
+        snapshot = r.read()
+        self.assertTrue(snapshot.complete)
+        self.assertEqual([v.completed for v in snapshot.videos], [False, True, False])
+        self.assertEqual(snapshot.diagnostics["strategy"], "native-cache")
+        self.assertEqual(request.TreeScope, 7)
+        self.assertEqual(request.AutomationElementMode, 1)
+        live_root.BuildUpdatedCache.assert_called_once_with(request)
+        self.assertTrue(r._controls[snapshot.videos[-1].play_token].IsOffscreen)
+
+    def test_native_cache_truncation_revokes_action_tokens(self):
+        r, _, _ = cached_reader(node_limit=35)
+        self.assertFalse(r.read().complete)
+        self.assertEqual(r._controls, {})
+
+    def test_native_cache_failure_does_not_fall_back_to_partial_ocr_inventory(self):
+        r, _, live_root = cached_reader()
+        live_root.BuildUpdatedCache.side_effect = RuntimeError("provider disconnected")
+        snapshot = r.read()
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(snapshot.videos, [])
+        self.assertEqual(r._controls, {})
+
+    def test_document_is_identified_by_url_when_browser_changes_title(self):
+        document = AccessibleNode(name="学生学习页面 - Microsoft Edge", kind="DocumentControl",
+                                  value="https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=c&chapterId=k")
+        self.assertIs(select_course_document(AccessibleNode(children=[document])), document)
+
+    def test_unnamed_course_document_is_also_identified_by_url(self):
+        document = AccessibleNode(kind="DocumentControl",
+                                  value="https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=c&chapterId=k")
+        self.assertIs(select_course_document(AccessibleNode(children=[document])), document)
     def test_entire_document_is_traversed_including_third_player(self):
         r = reader()
         snapshot = r.read()

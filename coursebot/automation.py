@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import queue
 import re
 import threading
@@ -8,6 +9,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +130,8 @@ class AutomationWorker(threading.Thread):
         self._last_inventory_text = ""
         self._accessible_navigation_at = 0.0
         self._incomplete_snapshot_since = None
+        self._last_live_inventory_save = 0.0
+        self._last_accessible_progress_log = 0.0
 
     # ------------------------------------------------------------------ 基础
     def _setup_logging(self) -> None:
@@ -808,6 +812,12 @@ class AutomationWorker(threading.Thread):
         while not self.stop_event.is_set():
             self._check_stop()
             if self._browser_reader and self._accessible_video_tick():
+                if self.settings.preview_enabled and time.time() - self.last_preview >= 2:
+                    # 此模式不运行旧 OCR 播放循环；仍更新真实画面，避免显示上一页的旧预览。
+                    self.last_preview = time.time()
+                    data = preview_jpeg(self._grab().image, 1000, 82)
+                    if data:
+                        self._emit("preview", jpeg=data)
                 self._sleep(1.0)
                 continue
             now = time.time()
@@ -925,6 +935,13 @@ class AutomationWorker(threading.Thread):
                 return True
             raise NavigationFailed(snapshot.problem or "无法确认完整章节身份和视频清单")
         self._incomplete_snapshot_since = None
+        now = time.monotonic()
+        if self.settings.save_debug_frames and now - self._last_live_inventory_save >= 5:
+            self._last_live_inventory_save = now
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            temporary = LOG_DIR / "live_inventory.tmp"
+            temporary.write_text(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(LOG_DIR / "live_inventory.json")
         if snapshot.complete and snapshot.popup_quiz:
             frame = self._grab()
             view = self._scan(frame, track_time=False)
@@ -944,12 +961,18 @@ class AutomationWorker(threading.Thread):
         if decision.action is Action.STOP:
             raise NavigationFailed(decision.reason)
         if decision.action is Action.LEGACY_PAGE:
-            return False
+            # 只将已确认的非视频内容交给原测验/导读处理；绝不进入旧播放路径。
+            return self._handle_accessible_nonvideo(snapshot)
         if decision.action is Action.WAIT:
             active = next((video for video in snapshot.videos if video.key == decision.video_key), None)
-            self._status("playing", decision.reason,
+            self.time_reading = None
+            self.time_box = None
+            self._status("playing" if active and active.paused is False else "scanning", decision.reason,
                          current=active.current if active else None,
                          duration=active.duration if active else None)
+            if active and now - self._last_accessible_progress_log >= 10:
+                self._last_accessible_progress_log = now
+                self._log(f"监控第 {active.order} 个视频：时间 {active.current}/{active.duration}；暂停={active.paused}")
             return True
         if self.settings.dry_run:
             self._log(f"[试运行] {snapshot.inventory_text()}；将执行：{decision.reason}", "dry")
@@ -984,6 +1007,27 @@ class AutomationWorker(threading.Thread):
                 return True
             return self._open_accessible_pending(snapshot)
         return False
+
+    def _handle_accessible_nonvideo(self, snapshot: CourseSnapshot) -> bool:
+        frame = self._grab()
+        view = self._scan(frame, track_time=False)
+        if view.exam.detected:
+            self._handle_exam(view, frame)
+            if self._chapter_quiz_done:
+                self._open_accessible_pending(self._browser_reader.read())
+            return True
+        if view.quiz.detected:
+            self._handle_quiz(view, frame)
+            return True
+        if view.quiz_entry:
+            self._click_line(view.quiz_entry, "进入章节测验")
+            self._sleep(1)
+            return True
+        if snapshot.page_kind == "empty" and self._click_empty_next(view):
+            return True
+        if snapshot.page_kind == "intro" and self._click_intro_next(view):
+            return True
+        raise NavigationFailed("已确认非视频页面，但未识别到相应操作入口；未执行播放点击")
 
     def _open_accessible_pending(self, snapshot: CourseSnapshot) -> bool:
         if self.settings.dry_run:
