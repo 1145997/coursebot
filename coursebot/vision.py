@@ -62,6 +62,16 @@ class TimeReading:
 
 
 @dataclass
+class VideoTask:
+    """同一屏里的一个播放器；坐标均相对于窗口截图。"""
+
+    bounds: tuple[int, int, int, int]
+    label: OcrLine | None = None
+    completed: bool | None = None
+    time: TimeReading | None = None
+
+
+@dataclass
 class SectionRow:
     number: str
     title: str
@@ -161,6 +171,9 @@ class PageView:
     completion_line: OcrLine | None = None
     task_line: OcrLine | None = None
     task_completed: bool | None = None
+    times: list[TimeReading] = field(default_factory=list)
+    videos: list[VideoTask] = field(default_factory=list)
+    active_video: VideoTask | None = None
 
 
 def format_seconds(value: float) -> str:
@@ -173,7 +186,10 @@ def format_seconds(value: float) -> str:
 
 
 def parse_time_text(text: str) -> tuple[float, float] | None:
-    m = TIME_RE.search(normalize_text(text))
+    text = normalize_text(text)
+    # 浅色控制栏的零常被 OCR 读成字母 O，只在完整时间格式前纠正。
+    text = re.sub(r"(?<!\w)[Oo](?=\s*:\s*\d{1,2}\s*[/／|])", "0", text)
+    m = TIME_RE.search(text)
     if not m:
         return None
     a, b, c, d = (int(x) for x in m.groups())
@@ -188,18 +204,92 @@ def parse_time_text(text: str) -> tuple[float, float] | None:
     return float(current), float(duration)
 
 
-def find_time_reading(lines: Iterable[OcrLine]) -> TimeReading | None:
+def find_time_readings(lines: Iterable[OcrLine]) -> list[TimeReading]:
     candidates: list[TimeReading] = []
     for line in lines:
         parsed = parse_time_text(line.text)
         if not parsed:
             continue
         candidates.append(TimeReading(parsed[0], parsed[1], line, line.text))
-    if not candidates:
-        return None
-    # 播放器时间在页面下方，取最靠下、面积最大的一个。
-    candidates.sort(key=lambda t: (t.line.y1, t.line.width * t.line.height))
-    return candidates[-1]
+    candidates.sort(key=lambda t: (t.line.y0, t.line.x0))
+    return candidates
+
+
+def find_time_reading(lines: Iterable[OcrLine]) -> TimeReading | None:
+    candidates = find_time_readings(lines)
+    return candidates[0] if candidates else None
+
+
+def find_video_tasks(
+    image: np.ndarray, lines: list[OcrLine], readings: list[TimeReading]
+) -> list[VideoTask]:
+    """将任务点、完成状态、时间关联起来，不要求视频画面为黑色。"""
+    h, w = image.shape[:2]
+    content_right = int(w * 0.72)
+    labels: list[OcrLine] = []
+    for line in sorted(lines, key=lambda item: item.y0):
+        text = compact_text(line.text)
+        if line.x0 >= content_right or not text.startswith("任务点"):
+            continue
+        if "完成条件" in text or len(text) > 12:
+            continue
+        if labels and abs(line.cy - labels[-1].cy) < line.height:
+            continue
+        labels.append(line)
+    videos: list[VideoTask] = []
+    used: set[int] = set()
+    for index, label in enumerate(labels):
+        bottom = labels[index + 1].y0 - 8 if index + 1 < len(labels) else h - 2
+        matches = [
+            (i, reading) for i, reading in enumerate(readings)
+            if label.y1 < reading.line.cy < bottom and reading.line.x0 < content_right
+        ]
+        reading = matches[0][1] if matches else None
+        if matches:
+            used.add(matches[0][0])
+        completed = True if "已完成" in compact_text(label.text) else None
+        if "未完成" in compact_text(label.text):
+            completed = False
+        if completed is None:
+            x0, x1 = max(0, label.x0 - 40), max(0, label.x0 - 2)
+            y0, y1 = max(0, label.cy - 18), min(h, label.cy + 18)
+            crop = image[y0:y1, x0:x1]
+            if crop.size:
+                hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+                yellow = int(np.count_nonzero(cv2.inRange(hsv, (8, 80, 100), (40, 255, 255))))
+                green = int(np.count_nonzero(cv2.inRange(hsv, (40, 80, 80), (90, 255, 255))))
+                if yellow >= 12 and yellow >= green:
+                    completed = False
+                elif green >= 12 and green > yellow:
+                    completed = True
+        x0 = max(0, label.x0 - 45)
+        y0 = min(bottom - 1, label.y1 + 8)
+        # 未显示控制栏时，仅估计这个任务点下方的画面，不跨入下个任务点。
+        y1 = reading.line.y1 if reading else min(bottom, y0 + int((content_right - x0) * 0.65))
+        videos.append(VideoTask((x0, y0, content_right, max(y0 + 1, y1)), label, completed, reading))
+    for i, reading in enumerate(readings):
+        if i in used or reading.line.x0 >= content_right:
+            continue
+        y0 = readings[i - 1].line.y1 + 12 if i else max(0, reading.line.y0 - int(w * 0.38))
+        videos.append(VideoTask((int(w * 0.04), y0, content_right, reading.line.y1), time=reading))
+    return sorted(videos, key=lambda video: video.bounds[1])
+
+
+def select_video(videos: list[VideoTask], preferred: OcrLine | None = None) -> VideoTask | None:
+    if preferred:
+        # 周期性全页扫描继续跟踪当前控制栏，避免跳到同屏另一个播放器。
+        nearby = [video for video in videos if video.time and
+                  abs(video.time.line.cy - preferred.cy) <= max(24, preferred.height * 2) and
+                  abs(video.time.line.cx - preferred.cx) <= max(80, preferred.width)]
+        if nearby:
+            return min(nearby, key=lambda video: abs(video.time.line.cy - preferred.cy))
+        containing = [video for video in videos if video.time is None and
+                      video.bounds[1] <= preferred.cy <= video.bounds[3] + 30]
+        # 当前控制栏隐藏时不能把另一个播放器的时间接管过来。
+        return containing[0] if containing else None
+    pending = [video for video in videos if video.completed is not True and
+               (video.time is None or video.time.current < video.time.duration - 0.5)]
+    return next(iter(pending or videos), None)
 
 
 def parse_section_line(text: str) -> tuple[str, str, int] | None:
@@ -1109,10 +1199,17 @@ def analyze_page(
     lines: list[OcrLine],
     previous_section: str | None = None,
     line_reader: Callable[[np.ndarray], str] | None = None,
+    preferred_time: OcrLine | None = None,
 ) -> PageView:
     h, w = image.shape[:2]
     view = PageView(width=w, height=h, lines=lines)
-    view.time = find_time_reading(lines)
+    view.times = [reading for reading in find_time_readings(lines) if reading.line.x0 < w * 0.72]
+    view.videos = find_video_tasks(image, lines, view.times)
+    view.active_video = select_video(view.videos, preferred_time)
+    if view.active_video:
+        view.time = view.active_video.time
+        view.task_line = view.active_video.label
+        view.task_completed = view.active_video.completed
     view.sections = find_sections(lines, w, h)
     if view.sections:
         mark_completed_sections(image, view.sections)
@@ -1132,16 +1229,6 @@ def analyze_page(
     view.start_button = find_start_button(lines)
     view.quiz_entry = find_quiz_entry(lines)
     view.completion_line = find_completion_line(lines)
-    for line in lines:
-        text = compact_text(line.text)
-        if "任务点已完成" in text:
-            view.task_line = line
-            view.task_completed = True
-            break
-        if "任务点" in text and "完成条件" not in text and "已完成" not in text:
-            if view.task_line is None:
-                view.task_line = line
-                view.task_completed = False
     return view
 
 
@@ -1174,6 +1261,11 @@ def annotate_frame(
     overlay = canvas.copy()
 
     if view:
+        for index, video in enumerate(view.videos, 1):
+            x0, y0, x1, y1 = video.bounds
+            color = (60, 220, 120) if video is view.active_video else (220, 160, 60)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), color, 2)
+            cv2.putText(canvas, f"VIDEO {index}", (x0 + 5, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         if view.time:
             x0, y0, x1, y1 = view.time.line.expanded(8)
             cv2.rectangle(canvas, (x0, y0), (x1, y1), (60, 220, 120), 3)
@@ -1277,6 +1369,7 @@ def ocr_debug_text(view: PageView) -> str:
     rows = [
         f"window={view.width}x{view.height}",
         f"time={view.time.raw if view.time else '-'}",
+        f"visible_videos={len(view.videos)} times={len(view.times)}",
         f"title={view.page_title!r}",
         f"current_idx={view.current_idx} evidence={view.current_evidence}",
         f"completion={'yes' if view.completion_line else 'no'}",
@@ -1286,6 +1379,8 @@ def ocr_debug_text(view: PageView) -> str:
         f"quiz_tab={view.exam.quiz_tab.text if view.exam.quiz_tab else '-'}",
         f"next_button={view.next_button.text if view.next_button else '-'}",
     ]
+    for index, video in enumerate(view.videos, 1):
+        rows.append(f"video[{index}] bounds={video.bounds} completed={video.completed} time={video.time.raw if video.time else '-'} active={video is view.active_video}")
     rows.append("sections:")
     for i, row in enumerate(view.sections):
         if row.completed:

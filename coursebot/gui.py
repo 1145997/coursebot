@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import threading
@@ -13,7 +14,9 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
+from . import __version__
 from .automation import AutomationWorker
+from .accessibility import BrowserAccessibility
 from .capture import ScreenCapture
 from .config import CONFIG_PATH, LOG_DIR, Settings, masked_key
 from .llm import LLMClient
@@ -116,7 +119,7 @@ class CourseBotApp:
         self.font_stat = tkfont.Font(family="Cascadia Mono", size=11, weight="bold")
 
     def _setup_window(self) -> None:
-        self.root.title("网课自动学习助手 · CourseBot")
+        self.root.title(f"网课自动学习助手 · CourseBot v{__version__}")
         self.root.configure(bg=BG)
         w, h = self.px(1250), self.px(830)
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -917,23 +920,14 @@ class CourseBotApp:
                     break
         if chosen is None and self.settings.window_title:
             for w in self.window_infos:
-                if self.settings.window_title in w.title:
+                if self.settings.window_title in w.title and w.title.startswith("学生学习页面"):
                     chosen = w
                     break
-        if chosen is None:
-            fg = get_window_info(__import__("ctypes").windll.user32.GetForegroundWindow())
-            if fg:
-                for w in self.window_infos:
-                    if w.hwnd == fg.hwnd:
-                        chosen = w
-                        break
         if chosen is None and self.window_infos:
             for w in self.window_infos:
-                if "学习" in w.title or "课程" in w.title or "Student" in w.title:
+                if w.title.startswith("学生学习页面"):
                     chosen = w
                     break
-        if chosen is None and self.window_infos:
-            chosen = self.window_infos[0]
         if chosen:
             self.selected_window = chosen
             self.var_window.set(chosen.label())
@@ -943,7 +937,7 @@ class CourseBotApp:
         else:
             self.selected_window = None
             self.var_window.set("")
-            self._append_log("warning", "未找到可用窗口，请打开浏览器后点击“刷新窗口”")
+            self._append_log("warning", "未找到课程学习页，请在独立浏览器打开课程后刷新并选择窗口")
 
     def _on_window_selected(self, _event=None) -> None:
         idx = self.window_combo.current()
@@ -1024,6 +1018,20 @@ class CourseBotApp:
             self.queue.put({"type": "log", "level": level, "text": text})
 
         try:
+            reader = BrowserAccessibility(win)
+            try:
+                inventory = reader.read()
+            finally:
+                reader.close()
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            from dataclasses import asdict
+            (LOG_DIR / "preview_inventory.json").write_text(
+                json.dumps(asdict(inventory), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if inventory.complete and inventory.page_key:
+                log("info", inventory.inventory_text())
+            else:
+                log("warning", f"整页盘点未完成：{inventory.problem or '无法确认章节身份'}")
             if self._preview_ocr is None:
                 self._preview_ocr = TextOCR(max_width)
                 self._preview_ocr.warmup()

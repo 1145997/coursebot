@@ -14,6 +14,8 @@ APP_NAME = "CourseBotDebug" if DEBUG_CONSOLE else "CourseBot"
 # RapidOCR 的 ONNX 模型、config.yaml 以及动态导入的识别器模块
 datas = collect_data_files("rapidocr_onnxruntime")
 hiddenimports = collect_submodules("rapidocr_onnxruntime")
+datas += collect_data_files("uiautomation")
+hiddenimports += collect_submodules("uiautomation")
 
 # onnxruntime 的 DLL / provider 插件
 binaries = collect_dynamic_libs("onnxruntime")

@@ -23,6 +23,7 @@ DEFAULT_MODEL = "glm-5-2-260617"
 
 @dataclass
 class Settings:
+    video_engine: str = "accessibility"  # accessibility | legacy_ocr
     # ---- 目标窗口 ----
     window_title: str = ""
     window_class: str = ""

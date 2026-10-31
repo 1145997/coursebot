@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 
 from .capture import Frame, ScreenCapture
+from .accessibility import BrowserAccessibility
+from .course_state import Action, CourseController, CourseSnapshot
 from .config import LOG_DIR, Settings, masked_key
 from .llm import LLMClient, LLMError
 from .ocr import OcrError, OcrLine, TextOCR
@@ -23,6 +25,7 @@ from .vision import (
     PageView,
     QuizView,
     TimeReading,
+    VideoTask,
     analyze_page,
     annotate_frame,
     compact_text,
@@ -114,11 +117,17 @@ class AutomationWorker(threading.Thread):
         self._page_video_key: str | None = None
         self._page_video_index = 0
         self._page_video_total = 0
+        self._page_scan_complete = False
         self.sections_finished = 0
         self.quizzes_solved = 0
         self._force_full = True
         self._debug_files: list[Path] = []
         self._stop_reason = "用户停止"
+        self._browser_reader = None
+        self._course_controller = CourseController()
+        self._last_inventory_text = ""
+        self._accessible_navigation_at = 0.0
+        self._incomplete_snapshot_since = None
 
     # ------------------------------------------------------------------ 基础
     def _setup_logging(self) -> None:
@@ -256,6 +265,8 @@ class AutomationWorker(threading.Thread):
             self._emit("stopped", reason=self._stop_reason)
 
     def _cleanup(self) -> None:
+        if self._browser_reader:
+            self._browser_reader.close()
         if self.capture:
             self.capture.close()
             self.capture = None
@@ -305,6 +316,10 @@ class AutomationWorker(threading.Thread):
             self._log("目标窗口未完全显示在屏幕内，部分识别/点击可能失败", "warning")
         self._log(f"窗口客户区：{self.window.width}×{self.window.height} @ ({self.window.left},{self.window.top})")
         self._status("scanning", "正在扫描页面…")
+        if self.settings.video_engine == "accessibility":
+            self._browser_reader = BrowserAccessibility(self.window)
+            if self._accessible_video_tick():
+                return
         # 上次可能停在页面中部；先回到顶部，避免漏掉上面的视频任务点。
         self._scroll_content_top()
         self._wake_controls()
@@ -405,13 +420,7 @@ class AutomationWorker(threading.Thread):
         return True
 
     def _video_needs_play(self, view: PageView) -> bool:
-        if view.task_completed is False:
-            return True
-        if view.current_idx is not None and view.sections:
-            row = view.sections[view.current_idx]
-            if row.pending_tasks == 2 and not row.completed:
-                return True
-        return False
+        return view.task_completed is False or any(video.completed is False for video in view.videos)
 
     def _looks_static(self) -> bool:
         """比较视频区域两帧，判断画面是否完全静止（多半是暂停/待播放）。"""
@@ -421,6 +430,9 @@ class AutomationWorker(threading.Thread):
         h, w = first.image.shape[:2]
         x0, x1 = int(w * 0.06), int(w * 0.68)
         y0, y1 = int(h * 0.12), int(h * 0.62)
+        if self.view and self.view.active_video:
+            x0, y0, x1, y1 = self.view.active_video.bounds
+            y1 = max(y0 + 1, y1 - 35)
         if x1 <= x0 or y1 <= y0:
             return False
         a = cv2.cvtColor(first.image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
@@ -552,6 +564,10 @@ class AutomationWorker(threading.Thread):
 
     def _maybe_enter_chapter_quiz(self, view: PageView, frame: Frame | None = None) -> bool:
         """任务点已完成但章节测验未做（橙色1）时，优先点“章节测验”标签。"""
+        if any(video.completed is not True and
+               (video.time is None or not self._is_near_end(video.time))
+               for video in view.videos):
+            return False
         tab = view.exam.quiz_tab or find_quiz_tab(view.lines, view.width, view.height)
         if not tab and frame is not None:
             tab = self._find_quiz_tab_zoomed(frame)
@@ -568,9 +584,8 @@ class AutomationWorker(threading.Thread):
                     break
         if row is not None and row.completed:
             return False
-        ready = bool(row and row.pending_tasks == 1)
-        if not ready and row is None and view.task_completed is True:
-            ready = True
+        # 橙色 1 也可能是单个未完成视频，必须先确认整页视频扫描结束。
+        ready = self._page_scan_complete and view.task_completed is True
         if not ready:
             return False
         self._log(
@@ -792,6 +807,9 @@ class AutomationWorker(threading.Thread):
     def _main_loop(self) -> None:
         while not self.stop_event.is_set():
             self._check_stop()
+            if self._browser_reader and self._accessible_video_tick():
+                self._sleep(1.0)
+                continue
             now = time.time()
             if self._refresh_geometry():
                 self._force_full = True
@@ -889,6 +907,111 @@ class AutomationWorker(threading.Thread):
             self._emit_preview(frame)
             elapsed = time.time() - now
             self._sleep(max(0.1, self.settings.poll_interval - elapsed))
+
+    def _accessible_video_tick(self, snapshot: CourseSnapshot | None = None) -> bool:
+        """整页清单模式与旧截图播放路径互斥，非视频页仍使用现有测验流程。"""
+        if not self._browser_reader:
+            return False
+        self._check_stop()
+        if not self._ensure_foreground():
+            raise StopAutomation()
+        snapshot = snapshot or self._browser_reader.read()
+        if not snapshot.complete or not snapshot.page_key:
+            now = time.monotonic()
+            if self._incomplete_snapshot_since is None:
+                self._incomplete_snapshot_since = now
+            if now - self._incomplete_snapshot_since < 10:
+                self._status("scanning", "等待整页任务清单完整，不执行输入")
+                return True
+            raise NavigationFailed(snapshot.problem or "无法确认完整章节身份和视频清单")
+        self._incomplete_snapshot_since = None
+        if snapshot.complete and snapshot.popup_quiz:
+            frame = self._grab()
+            view = self._scan(frame, track_time=False)
+            if not view.quiz.detected:
+                raise NavigationFailed("播放器出现弹题，但题面未识别完整，停止播放点击")
+            self._handle_quiz(view, frame)
+            return True
+        if snapshot.page_key != self._course_controller.page_key:
+            self._reset_video_tracking()
+            self._video_retry_count = 0
+            self._last_video_retry = 0
+        decision = self._course_controller.decide(snapshot, time.monotonic(), self.settings.auto_resume)
+        inventory = f"{snapshot.page_key} {snapshot.inventory_text()}"
+        if snapshot.videos and inventory != self._last_inventory_text:
+            self._last_inventory_text = inventory
+            self._log(snapshot.inventory_text())
+        if decision.action is Action.STOP:
+            raise NavigationFailed(decision.reason)
+        if decision.action is Action.LEGACY_PAGE:
+            return False
+        if decision.action is Action.WAIT:
+            active = next((video for video in snapshot.videos if video.key == decision.video_key), None)
+            self._status("playing", decision.reason,
+                         current=active.current if active else None,
+                         duration=active.duration if active else None)
+            return True
+        if self.settings.dry_run:
+            self._log(f"[试运行] {snapshot.inventory_text()}；将执行：{decision.reason}", "dry")
+            self._stop_reason = "整页盘点试运行完成（未执行输入）"
+            raise StopAutomation()
+        if decision.action in {Action.PLAY, Action.OPEN_VIDEO_TAB, Action.PAUSE_COMPLETED}:
+            self._browser_reader.activate(decision.token, self._click_screen)
+            self._course_controller.acted(decision, time.monotonic())
+            self._log(decision.reason)
+            return True
+        if decision.action is Action.LOAD_ERROR:
+            if self._video_retry_count >= 4:
+                raise NavigationFailed("视频加载连续重试失败，停止重复输入")
+            if time.time() - self._last_video_retry < 2.5:
+                return True
+            frame = self._grab()
+            view = self._scan(frame, track_time=False)
+            if self._retry_video_error(view):
+                return True
+            raise NavigationFailed("已确认播放器加载错误，但未找到可操作的重试入口")
+        if decision.action is Action.PAGE_DONE:
+            self._reset_video_tracking()
+            if not self.settings.auto_next:
+                self._stop_reason = "整页视频已完成（自动切换已关闭）"
+                raise StopAutomation()
+            chapter_id = snapshot.page_key.split(":")[-1].split("@")[0]
+            current_pending = any(row.key == f"cur{chapter_id}" for row in snapshot.pending)
+            if snapshot.quiz_tab_token and current_pending and not self._chapter_quiz_done:
+                self._browser_reader.activate(snapshot.quiz_tab_token, self._click_screen)
+                self._log("整页视频已完成，进入本节章节测验")
+                self._sleep(1)
+                return True
+            return self._open_accessible_pending(snapshot)
+        return False
+
+    def _open_accessible_pending(self, snapshot: CourseSnapshot) -> bool:
+        if self.settings.dry_run:
+            self._stop_reason = "试运行不切换橙色目录"
+            raise StopAutomation()
+        if self.sections_finished >= self.settings.max_sections:
+            self._stop_reason = "已达到最多连续学习章节数"
+            raise StopAutomation()
+        chapter_id = snapshot.page_key.split(":")[-1].split("@")[0]
+        pending = [row for row in snapshot.pending if row.key != f"cur{chapter_id}"]
+        if not pending:
+            if snapshot.pending:
+                raise NavigationFailed("本节视频已完成，但仍有其他类型任务，未找到可处理入口")
+            self._stop_reason = "整页目录未发现橙色待办"
+            raise StopAutomation()
+        target = pending[0]
+        self._browser_reader.activate(target.token, self._click_screen)
+        self._chapter_quiz_done = False
+        self._reset_video_tracking()
+        self._log(f"本节已完成，进入橙色待办：{target.title}")
+        for _ in range(3):
+            self._sleep(0.8)
+            check = self._browser_reader.read()
+            if check.complete and check.page_key and check.page_key != snapshot.page_key:
+                self.sections_finished += 1
+                self._emit("stats", sections=self.sections_finished, quizzes=self.quizzes_solved)
+                return True
+        raise NavigationFailed("已操作橙色目录，但未确认章节切换，停止重复点击")
 
     def _refresh_geometry(self) -> bool:
         now = time.time()
@@ -1027,10 +1150,34 @@ class AutomationWorker(threading.Thread):
         self._force_full = True
 
     def _is_near_end(self, reading: TimeReading) -> bool:
-        if self.duration <= 0:
+        if reading.duration <= 0:
             return False
         margin = max(0.5, float(self.settings.completion_margin))
-        return reading.current >= self.duration - margin
+        return reading.current >= reading.duration - margin
+
+    def _reset_video_tracking(self, reading: TimeReading | None = None) -> None:
+        """切换播放器时清除旧视频的进度、结束确认和恢复冷却。"""
+        self.time_box = None
+        self.time_reading = None
+        self.duration = 0.0
+        self.last_current = None
+        self._same_time_value = None
+        self._same_time_since = 0.0
+        self.last_time_read_at = 0.0
+        self.end_streak = 0
+        self.completion_handled = False
+        self.fast_fail = 0
+        self.resume_attempts = 0
+        self.last_stall_attempt = 0.0
+        self._last_icon_resume = 0.0
+        self.last_logged_bucket = -1
+        self.video_playing_unknown_time = False
+        self._no_time_since = None
+        self.last_progress_wall = time.time()
+        self._force_full = True
+        self._page_scan_complete = False
+        if reading:
+            self._adopt_time(reading)
 
     def _time_status_text(self) -> str:
         if not self.time_reading:
@@ -1141,7 +1288,7 @@ class AutomationWorker(threading.Thread):
         return TimeReading(current, duration, line, text)
 
     # ------------------------------------------------------------------ 扫描 / 暂停
-    def _scan(self, frame: Frame) -> PageView:
+    def _scan(self, frame: Frame, *, track_time: bool = True) -> PageView:
         if not self.ocr:
             raise RuntimeError("OCR 未初始化")
         try:
@@ -1149,7 +1296,8 @@ class AutomationWorker(threading.Thread):
         except OcrError as exc:
             raise RuntimeError(str(exc)) from exc
         view = analyze_page(
-            frame.image, lines, self.current_key, line_reader=self.ocr.line
+            frame.image, lines, self.current_key, line_reader=self.ocr.line,
+            preferred_time=self.time_box if track_time else None,
         )
         self.view = view
         self.last_full_scan = time.time()
@@ -1158,7 +1306,7 @@ class AutomationWorker(threading.Thread):
             if view.current_idx is not None:
                 self.current_idx = view.current_idx
                 self.current_key = view.sections[view.current_idx].key
-        if view.time:
+        if view.time and track_time:
             self._adopt_time(view.time)
         if view.quiz.detected:
             self._log(
@@ -1175,6 +1323,8 @@ class AutomationWorker(threading.Thread):
             # 结尾处播放按钮会变成“重播”，此时点播放会把视频重头播放，必须先切下一节。
             self._log("画面停在结尾附近，优先尝试进入下一节，避免误点重播", "warning")
             self.completion_handled = True
+            if self._try_next_video_on_page(frame):
+                return
             if not self._advance("结尾处画面停滞"):
                 raise NavigationFailed(self._stop_reason)
             return
@@ -1272,7 +1422,9 @@ class AutomationWorker(threading.Thread):
                     return True
         return False
 
-    def _find_center_play_button(self, frame: Frame) -> tuple[int, int, bool]:
+    def _find_center_play_button(
+        self, frame: Frame, bounds: tuple[int, int, int, int] | None = None
+    ) -> tuple[int, int, bool]:
         """OpenCV 找黑色视频区域中央的播放圆钮，找不到再用视频区域估算中心。"""
         img = frame.image
         h, w = img.shape[:2]
@@ -1281,9 +1433,14 @@ class AutomationWorker(threading.Thread):
         sx0, sx1 = int(w * 0.04), int(w * 0.70)
         sy0, sy1 = int(h * 0.14), int(h * 0.90)
         video_rect: tuple[int, int, int, int] | None = None
+        if bounds is None and self.view and self.view.active_video:
+            bounds = self.view.active_video.bounds
+        if bounds is not None:
+            sx0, sy0, sx1, sy1 = bounds
+            video_rect = (sx0, sy0, sx1 - sx0, sy1 - sy0)
         crop_mask = (gray[sy0:sy1, sx0:sx1] < 40).astype(np.uint8) * 255
         contours, _ = cv2.findContours(crop_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
+        if contours and video_rect is None:
             largest = max(contours, key=cv2.contourArea)
             if cv2.contourArea(largest) > (w * h) * 0.08:
                 vx, vy, vw, vh = cv2.boundingRect(largest)
@@ -1465,6 +1622,13 @@ class AutomationWorker(threading.Thread):
             (self.window.left + int(w * 0.56), self.window.top + int(h * 0.80)),
             (self.window.left + int(w * 0.43), self.window.top + int(h * 0.72)),
         ]
+        if self.view and self.view.active_video:
+            x0, y0, x1, y1 = self.view.active_video.bounds
+            points = [
+                (self.window.left + int(x0 + (x1 - x0) * ratio),
+                 self.window.top + max(y0, y1 - 40))
+                for ratio in (0.35, 0.65, 0.5)
+            ]
         try:
             import ctypes
 
@@ -1492,6 +1656,13 @@ class AutomationWorker(threading.Thread):
         x1 = self.window.left + int(w * (0.38 if self._jiggle_toggle else 0.52))
         x2 = self.window.left + int(w * (0.52 if self._jiggle_toggle else 0.38))
         y = self.window.top + int(h * 0.76)
+        if self.time_box:
+            # 控制栏属于当前播放器，不能用全窗口固定的 76% 高度。
+            x1 = self.window.left + self.time_box.cx + 50
+            x2 = self.window.left + self.time_box.cx + 80
+            y = self.window.top + max(0, self.time_box.y0 - 25)
+            x1 = min(self.window.right - 2, x1)
+            x2 = min(self.window.right - 2, x2)
         try:
             import ctypes
 
@@ -2856,175 +3027,131 @@ class AutomationWorker(threading.Thread):
     def _note_page_videos(self, view: PageView) -> None:
         """记录当前小节页面有几个视频（任务点），用于同页第二个视频。"""
         key = None
-        row = None
         if view.current_idx is not None and view.sections:
-            row = view.sections[view.current_idx]
-            key = row.key
+            key = view.sections[view.current_idx].key
         if key is None:
             key = view.page_title or self.current_key
         if not key or key == self._page_video_key:
             return
         self._page_video_key = key
         self._page_video_index = 0
-        labels = sum(
-            1 for line in view.lines if compact_text(line.text) == "任务点"
-        )
-        pending = row.pending_tasks if row else 0
-        self._page_video_total = max(labels, pending or 0)
+        self._page_video_total = len(view.videos)
         if self._page_video_total >= 2:
             self._log(
-                f"当前小节识别到 {self._page_video_total} 个视频任务点，"
-                "播完第一个会向下滚动找第二个",
-                "warning",
+                f"当前屏幕识别到 {self._page_video_total} 个播放器，将逐个监控同页视频",
+                "info",
             )
-
-    @staticmethod
-    def _task_dot_color(frame: Frame, line: OcrLine) -> str | None:
-        """看“任务点”左侧圆点是黄色未完成，还是绿色已完成。"""
-        try:
-            h, w = frame.image.shape[:2]
-            x0 = max(0, int(line.x0) - 40)
-            x1 = max(x0 + 1, int(line.x0) - 2)
-            y0 = max(0, int(line.cy) - 18)
-            y1 = min(h, int(line.cy) + 18)
-            crop = frame.image[y0:y1, x0:x1]
-            if crop.size == 0:
-                return None
-            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-            yellow = cv2.inRange(hsv, (8, 80, 100), (40, 255, 255))
-            green = cv2.inRange(hsv, (40, 80, 80), (90, 255, 255))
-            yn = int((yellow > 0).sum())
-            gn = int((green > 0).sum())
-            if yn >= 12 and yn >= gn:
-                return "yellow"
-            if gn >= 12 and gn > yn:
-                return "green"
-        except Exception:
-            return None
-        return None
-
-    @staticmethod
-    def _dark_video_rects(frame: Frame) -> list[tuple[int, int, int, int]]:
-        """找页面正文里的黑色视频矩形，不依赖任务点数字。"""
-        img = frame.image
-        h, w = img.shape[:2]
-        x0, x1 = int(w * 0.03), int(w * 0.72)
-        y0, y1 = int(h * 0.02), int(h * 0.98)
-        gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        mask = (gray < 32).astype(np.uint8) * 255
-        kernel = np.ones((11, 11), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        rects = []
-        for contour in contours:
-            x, y, cw, ch = cv2.boundingRect(contour)
-            if cw < (x1 - x0) * 0.30 or ch < (y1 - y0) * 0.12:
-                continue
-            if cw * ch < (x1 - x0) * (y1 - y0) * 0.05:
-                continue
-            rects.append((x0 + x, y0 + y, cw, ch))
-        rects.sort(key=lambda r: r[1])
-        return rects
 
     def _find_unfinished_video_below(
         self, frame: Frame, view: PageView, min_y: float
-    ) -> tuple[int, int] | None:
-        """在 min_y 下方找“黄色任务点 + 黑色视频”，返回视频中心。"""
-        labels = [
-            line
-            for line in view.lines
-            if compact_text(line.text) == "任务点" and line.cy > min_y
-        ]
-        rects = self._dark_video_rects(frame)
-        for label in sorted(labels, key=lambda l: l.cy):
-            if self._task_dot_color(frame, label) != "yellow":
+    ) -> VideoTask | None:
+        """只使用这一帧中的任务点/时间，允许彩色封面及相同时长的视频。"""
+        for video in view.videos:
+            if video.completed is True:
                 continue
-            below = [
-                rect
-                for rect in rects
-                if rect[1] >= label.y1 - 10 and rect[1] <= label.cy + 700
-            ]
-            if not below:
-                continue
-            x, y, cw, ch = below[0]
-            return x + cw // 2, y + ch // 2
+            if video.time:
+                if video.time.line.cy <= min_y or self._is_near_end(video.time):
+                    continue
+                return video
+            if video.label and video.label.cy > min_y and video.completed is False:
+                _, _, found = self._find_center_play_button(frame, video.bounds)
+                if found:
+                    return video
         return None
 
     def _activate_unfinished_video(
         self, frame: Frame, view: PageView, min_y: float
     ) -> bool:
         target = self._find_unfinished_video_below(frame, view, min_y)
-        if not target:
+        if target is None:
             return False
-        self._log("发现下方黄色任务点的黑色视频，点击播放", "warning")
-        self._click_screen(target[0], target[1], "下方未完成视频")
-        self._sleep(2.0)
-        try:
-            x = self.window.left + int(self.window.width * 0.42)
-            y = self.window.top + int(self.window.height * 0.58)
-            self.clicker.scroll(x, y, -2)
-        except Exception:
-            pass
-        self._sleep(0.6)
-        frame = self._grab()
-        view = self._scan(frame)
-        if view.time and view.time.duration > 0 and (
-            view.time.current < view.time.duration - 5
-        ):
-            self._adopt_time(view.time)
-            self.end_streak = 0
-            self.last_progress_wall = time.time()
-            self.completion_handled = False
+        view.active_video = target
+        view.time = target.time
+        view.task_line = target.label
+        view.task_completed = target.completed
+        self._reset_video_tracking(target.time)
+        self._page_video_index += 1
+        if target.time:
+            # 有时间就先监控；已在播放时不能再点中央把它暂停。
+            self._log(
+                f"同页接管下一个视频：{target.time.current_text()} / "
+                f"{target.time.duration_text()}，重新监控播放状态",
+                "warning",
+            )
             return True
-        self.completion_handled = False
-        self._force_full = True
+        x, y, found = self._find_center_play_button(frame, target.bounds)
+        if not found:
+            return False
+        # 定位函数返回屏幕坐标，已包含窗口偏移。
+        self._log("同页发现未完成视频的播放按钮，点击后重新识别", "warning")
+        self._click_screen(x, y, "同页未完成视频播放按钮")
+        self._sleep(1.0)
         return True
 
+    @staticmethod
+    def _content_signature(frame: Frame) -> np.ndarray:
+        h, w = frame.image.shape[:2]
+        crop = frame.image[int(h * 0.14):int(h * 0.97), int(w * 0.04):int(w * 0.70)]
+        return cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (160, 100))
+
     def _try_next_video_on_page(self, frame: Frame) -> bool:
-        """视频播完后慢慢向下扫；每一小步都检查黄色任务点+黑色视频。"""
+        """播完后逐屏扫描正文；确认到底且没有待播视频才允许离开小节。"""
+        if self.settings.dry_run:
+            self._log("[试运行] 视频结束后将扫描同页其余播放器，不执行滚动/点击", "dry")
+            self._stop_reason = "试运行完成（同页视频扫描未执行）"
+            raise StopAutomation()
         x = self.window.left + int(self.window.width * 0.42)
         y = self.window.top + int(self.window.height * 0.58)
-        min_y = (self.time_box.cy + 40) if self.time_box else 0
-
-        # 先看当前画面，第二个视频可能已经在下方可见，不能先滚过头。
-        view = self._scan(frame)
+        min_y = self.time_box.y1 if self.time_box else 0
+        view = self._scan(frame, track_time=False)
+        if view.quiz.detected or view.exam.detected:
+            self.completion_handled = False
+            self._force_full = True
+            return True
         if self._activate_unfinished_video(frame, view, min_y):
             return True
-
-        for _ in range(16):
+        previous = self._content_signature(frame)
+        stable = 0
+        for _ in range(32):
+            self._check_stop()
+            if not self._ensure_foreground():
+                raise StopAutomation()
             try:
-                # 每次只滚 2 格，慢扫，避免直接滑过中间视频。
                 self.clicker.scroll(x, y, -2)
-            except Exception:
-                break
+            except Exception as exc:
+                raise NavigationFailed(f"扫描同页视频时滚动失败：{exc}") from exc
             self._sleep(0.8)
             frame = self._grab()
-            view = self._scan(frame)
-            if self._activate_unfinished_video(frame, view, min_y):
+            view = self._scan(frame, track_time=False)
+            if view.quiz.detected or view.exam.detected:
+                self._reset_video_tracking()
                 return True
-
-            # 没有黄色任务点时，再看是否有另一个未结束的视频时间。
-            if view.time and view.time.duration > 0 and (
-                view.time.current < view.time.duration - 5
-            ):
-                self._adopt_time(view.time)
-                self.completion_handled = False
-                self.end_streak = 0
-                self.last_progress_wall = time.time()
-                self._log(
-                    f"同页发现下一个视频：{view.time.current_text()} / "
-                    f"{view.time.duration_text()}，继续播放",
-                    "warning",
-                )
+            # 滚动之后原 time_box 的屏幕纵坐标已经失效。
+            # 已结束的视频按各自时长排除；新播放器允许从 0 秒或更低进度开始。
+            if self._activate_unfinished_video(frame, view, 0):
                 return True
-        self._log("已慢速向下扫到底，没有发现同页下一个未完成视频", "warning")
-        return False
+            signature = self._content_signature(frame)
+            diff = float(np.mean(cv2.absdiff(signature, previous)))
+            stable = stable + 1 if diff < 0.5 else 0
+            previous = signature
+            if stable >= 2:
+                unresolved = [video for video in view.videos if video.completed is False and
+                              (video.time is None or not self._is_near_end(video.time))]
+                if unresolved:
+                    raise NavigationFailed("同页仍有未完成视频，但未能确认播放按钮或时间；已停止，避免漏播后跳节。")
+                self._log("正文连续两次滚动无变化，未发现同页待播视频", "info")
+                self._page_scan_complete = True
+                return False
+        raise NavigationFailed("同页视频扫描达到上限，尚未确认正文底部；已停止，避免跳过视频。")
 
     def _advance(self, reason: str) -> bool:
         if self.navigating:
             return True
+        if (not self._browser_reader and not self._page_scan_complete and self.view and self.view.videos
+                and not self.view.exam.detected):
+            # 启动时已经结束、无时间的已完成任务点等入口也必须先查同页视频。
+            if self._try_next_video_on_page(self._grab()):
+                return True
         self.navigating = True
         try:
             if not self.settings.auto_next:
@@ -3078,6 +3205,13 @@ class AutomationWorker(threading.Thread):
                 self._sleep(1.0)
                 frame = self._grab()
                 view = self._scan(frame)
+            if self._browser_reader:
+                snapshot = self._browser_reader.read()
+                if not snapshot.complete or not snapshot.page_key:
+                    raise NavigationFailed(snapshot.problem or "无法确认整页目录状态")
+                if snapshot.videos:
+                    return self._accessible_video_tick(snapshot)
+                return self._open_accessible_pending(snapshot)
             before_title = view.page_title
             before_key = self.sections[view.current_idx].key if view.current_idx is not None and view.sections else self.current_key
             before_current = view.time.current if view.time else None
@@ -3128,7 +3262,7 @@ class AutomationWorker(threading.Thread):
                 self._sleep(max(0.9, min(1.5, self.settings.nav_wait_seconds)))
                 self._scroll_content_top()
                 new_frame = self._grab()
-                new_view = self._scan(new_frame)
+                new_view = self._scan(new_frame, track_time=False)
                 if self._handle_unfinished_confirm(new_view):
                     self.completion_handled = False
                     return True
@@ -3172,14 +3306,7 @@ class AutomationWorker(threading.Thread):
                     self.current_key = new_key or target_number
                     self.current_idx = new_view.current_idx if new_view.current_idx is not None else idx + 1 if idx is not None else None
                     self.completion_handled = False
-                    self.time_box = new_view.time.line if new_view.time else None
-                    self.time_reading = new_view.time
-                    self.duration = new_view.time.duration if new_view.time else 0.0
-                    self.last_current = new_view.time.current if new_view.time else None
-                    self.last_progress_wall = time.time()
-                    self.end_streak = 0
-                    self.completion_handled = False
-                    self.fast_fail = 0
+                    self._reset_video_tracking(new_view.time)
                     self.last_full_scan = 0
                     self._force_full = True
                     self._no_time_since = None
