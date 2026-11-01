@@ -79,6 +79,40 @@ class PopupSelectionTests(unittest.TestCase):
         self.assertLessEqual(abs(x - 371), 6)
         self.assertLessEqual(abs(y - 702), 2)
 
+    def test_blue_lecture_background_does_not_select_unchecked_radio_controls(self):
+        pixels = np.full((1528, 2560, 3), (100, 50, 0), np.uint8)
+        cv2.circle(pixels, (371, 702), 12, (255, 255, 255), -1)
+        cv2.circle(pixels, (371, 794), 12, (255, 255, 255), -1)
+        frame = Frame(pixels, 0, 0, 0)
+        self.assertEqual(set(self.w._popup_radio_controls(frame, self.q)), {"A", "B"})
+        self.assertEqual(self.w._popup_selected_letters(frame, self.q), set())
+        cv2.circle(pixels, (371, 794), 12, (255, 150, 60), -1)
+        self.assertEqual(self.w._popup_selected_letters(frame, self.q), {"B"})
+
+    def test_missing_round_control_is_not_clicked_or_submitted(self):
+        pixels = np.full((1528, 2560, 3), (100, 50, 0), np.uint8)
+        _, confirmed = self.w._set_popup_radio(self.q, "A", Frame(pixels, 0, 0, 0))
+        self.assertFalse(confirmed)
+        self.w._click_screen.assert_not_called()
+        self.w._click_line.assert_not_called()
+
+    def test_explicit_judgment_type_is_not_changed_by_color_or_parentheses(self):
+        self.q.question = "题干包含（）和()"
+        self.w.view = PageView(2560, 1528, [line("讲义中出现多选题字样", 600, 900)])
+        self.w._popup_selected_letters = Mock(return_value={"A", "B"})
+        self.w._set_popup_radio = Mock(return_value=(self.frame, True))
+        self.w._set_popup_combo = Mock()
+        self.w._submit_popup_answer = Mock(return_value=(self.frame, "closed", None))
+        self.w._popup_after_success = Mock(return_value=None)
+        self.w._solve_popup_enumeration(self.q, self.frame)
+        self.assertEqual(self.q.kind, "判断题")
+        self.assertEqual(self.w._popup_enumeration_plan(self.q), [["A"], ["B"]])
+        self.w._set_popup_combo.assert_not_called()
+
+    def test_popup_header_takes_priority_over_question_type_words_in_lecture(self):
+        lines = incomplete_ocr() + [line("A、对", 412, 690), line("讲义中的多选题示例", 700, 900)]
+        self.assertEqual(detect_quiz(lines, 2560, 1528).kind, "判断题")
+
     def test_unconfirmed_radio_never_submits_or_counts_as_a_wrong_answer(self):
         self.w._set_popup_radio = Mock(return_value=(self.frame, False))
         self.w._submit_popup_answer = Mock()

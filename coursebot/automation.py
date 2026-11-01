@@ -2625,8 +2625,48 @@ class AutomationWorker(threading.Thread):
             return None
         return None
 
+    def _popup_radio_controls(self, frame: Frame, quiz: QuizView) -> dict:
+        """先确认圆形控件，再读圆内颜色，避免蓝色讲义背景被当作选中。"""
+        controls = {}
+        h, w = frame.image.shape[:2]
+        for opt in quiz.options:
+            line = opt.line
+            margin = max(24, int(line.height * .9))
+            x0, x1 = max(0, line.x0 - 100), min(w, line.x0 - 15)
+            y0, y1 = max(0, line.cy - margin), min(h, line.cy + margin)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            roi = frame.image[y0:y1, x0:x1]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, 15, param1=80, param2=10,
+                                      minRadius=max(5, int(line.height * .2)),
+                                      maxRadius=min(24, max(12, int(line.height * .8))))
+            if circles is None:
+                continue
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
+            expected_x = line.x0 - 42 * max(.9, line.height / 28)
+            candidates = []
+            for x, y, radius in circles[0]:
+                distance = ((x + x0 - expected_x) ** 2 + (y + y0 - line.cy) ** 2) ** .5
+                if distance > max(16, line.height * .8):
+                    continue
+                disk = (xx - x) ** 2 + (yy - y) ** 2 <= (radius * .95) ** 2
+                if not np.any(disk) or float((hsv[:, :, 2][disk] >= 150).mean()) < .55:
+                    continue
+                blue = ((hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 175) &
+                        (hsv[:, :, 1] >= 80) & (hsv[:, :, 2] >= 125))
+                selected = float(blue[disk].mean()) > .18
+                candidates.append((distance, (int(round(x + x0)), int(round(y + y0))), selected))
+            if candidates:
+                _, center, selected = min(candidates, key=lambda item: item[0])
+                controls[opt.letter] = (center, selected)
+        return controls
+
     def _popup_selected_letters(self, frame: Frame, quiz: QuizView) -> set[str]:
         """通过选项左侧复选框的紫色字母判断当前已选中的项。"""
+        if quiz.kind in {"判断题", "单选题"}:
+            return {letter for letter, (_, selected) in self._popup_radio_controls(frame, quiz).items() if selected}
         selected: set[str] = set()
         try:
             hsv = cv2.cvtColor(frame.image, cv2.COLOR_BGR2HSV)
@@ -2671,11 +2711,16 @@ class AutomationWorker(threading.Thread):
         if opt is None:
             return frame, False
         for attempt in range(2):
-            if self._popup_selected_letters(frame, quiz) == {letter}:
+            controls = self._popup_radio_controls(frame, quiz)
+            if letter not in controls:
+                return frame, False
+            selected = {key for key, (_, checked) in controls.items() if checked}
+            if selected == {letter}:
                 self._log(f"已确认选中弹题选项 {letter}")
                 return frame, True
             if attempt == 0:
-                self._click_popup_option(opt)
+                x, y = controls[letter][0]
+                self._click_screen(self.window.left + x, self.window.top + y, f"弹题单选圆圈 {letter}")
             else:
                 self._click_line(opt.line, f"弹题选项 {letter} 文本")
             self._sleep(.15)
@@ -2764,26 +2809,6 @@ class AutomationWorker(threading.Thread):
                 self._log("弹题没有识别到可点击选项，停止自动作答", "error")
                 self._stop_reason = "弹题选项识别失败，需人工处理"
                 raise NavigationFailed(self._stop_reason)
-
-            page_text = " ".join(
-                line.text.replace(" ", "")
-                for line in (self.view.lines if self.view else [])
-            )
-            if current.kind != "多选题" and (
-                "多选题" in page_text or "不定项" in page_text
-            ):
-                current.kind = "多选题"
-            blanks = current.question.count("()") + current.question.count("（）")
-            blanks += current.question.count("( )") + current.question.count("（ ）")
-            selected_now = self._popup_selected_letters(frame, current)
-            if current.kind not in ("多选题",) and (
-                blanks >= 2 or len(selected_now) >= 2
-            ):
-                current.kind = "多选题"
-                self._log(
-                    f"题干有 {blanks} 个空/已选中 {len(selected_now)} 项，按多选题完全遍历",
-                    "warning",
-                )
 
             option_letters = sorted({opt.letter for opt in current.options})
             expected_letters = [chr(ord("A") + i) for i in range(len(option_letters))]

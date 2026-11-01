@@ -1096,14 +1096,15 @@ def detect_quiz(lines: list[OcrLine], width: int, height: int) -> QuizView:
                       and marker.x0 - 60 <= line.x0 < width * .72]
         option_lines = [line for line in body_lines if line.y0 >= marker.y1 and
                         line.x0 < marker.x0 + max(300, width * .22)]
-    options, multiple_sets = _extract_options(option_lines, _quiz_kind(compact_all))
+    kind_hint = _quiz_kind(marker.text if marker else compact_all)
+    options, multiple_sets = _extract_options(option_lines, kind_hint)
     if len(options) < 2:
         # 没有选项但存在明确题面 + 提交按钮，也可进入作答流程（填空题由人工处理）
         if submit and has_marker:
             question = _extract_question(body_lines, None, width, height)
             return QuizView(
                 detected=True,
-                kind=_quiz_kind(question + compact_all),
+                kind=kind_hint,
                 question=question,
                 submit=submit,
                 options=options,
@@ -1118,7 +1119,7 @@ def detect_quiz(lines: list[OcrLine], width: int, height: int) -> QuizView:
     if not submit and not has_marker:
         return QuizView()
 
-    kind = _quiz_kind(compact_all + " " + " ".join(o.text for o in options))
+    kind = kind_hint if marker else _quiz_kind(compact_all + " " + " ".join(o.text for o in options))
     question = _extract_question(body_lines, options, width, height)
     if not question and not has_marker:
         return QuizView()
