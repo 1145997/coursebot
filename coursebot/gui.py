@@ -1051,7 +1051,7 @@ class CourseBotApp:
             frame = cap.grab()
             lines = self._preview_ocr.full(frame.image)
             view = analyze_page(
-                frame.image, lines, line_reader=self._preview_ocr.line
+                frame.image, lines, line_reader=self._preview_ocr.line, popup_reader=self._preview_ocr.full
             )
             annotated = annotate_frame(
                 frame.image,

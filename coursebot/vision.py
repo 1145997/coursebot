@@ -955,7 +955,7 @@ def _extract_options(lines: list[OcrLine], kind: str) -> tuple[list[QuizOption],
 
     # 少数播放器把复选框和选项文字分开渲染：例如字母 C 只在紫色方框里，
     # OCR 只读到“法律”。按行间距和字母顺序把这类“无字母的文字行”补回缺失选项。
-    if 2 <= len(options) + len(standalone) <= 8:
+    if kind != "判断题" and 2 <= len(options) + len(standalone) <= 8:
         used = {id(o.line) for o in options.values()} | {
             id(line) for line in standalone.values()
         }
@@ -1010,13 +1010,13 @@ def _extract_options(lines: list[OcrLine], kind: str) -> tuple[list[QuizOption],
                 known[letter] = best_line.cy
 
     if len(options) < 2 and kind == "判断题":
-        right = find_button(lines, ["正确", "对", "√"], exact=False)
-        wrong = find_button(lines, ["错误", "错", "×"], exact=False)
+        right = find_button(lines, ["正确", "对", "√"], exact=True)
+        wrong = find_button(lines, ["错误", "错", "×"], exact=True)
         if right and wrong:
-            options = {
-                "A": QuizOption("A", "正确", right),
-                "B": QuizOption("B", "错误", wrong),
-            }
+            options.setdefault("A", QuizOption("A", "正确", right))
+            options.setdefault("B", QuizOption("B", "错误", wrong))
+    if kind == "判断题":
+        options = {key: opt for key, opt in options.items() if key in {"A", "B"}}
 
     ordered = sorted(options.values(), key=lambda o: (o.line.cy, o.line.cx))
     letters = [o.letter for o in ordered]
@@ -1029,6 +1029,15 @@ def _quiz_kind(text: str) -> str:
         if kind in text:
             return "多选题" if kind == "不定项选择题" else kind
     return "选择题"
+
+
+def _popup_marker(lines: list[OcrLine], width: int, submit: OcrLine | None) -> OcrLine | None:
+    if not submit:
+        return None
+    markers = [line for line in lines if compact_text(line.text) in
+               {"判断题", "单选题", "多选题", "不定项选择题"} and
+               line.x0 < width * .65 and line.y1 < submit.y0]
+    return max(markers, key=lambda line: line.y0) if markers else None
 
 
 def detect_quiz(lines: list[OcrLine], width: int, height: int) -> QuizView:
@@ -1078,16 +1087,26 @@ def detect_quiz(lines: list[OcrLine], width: int, height: int) -> QuizView:
                 signature=hashlib.md5(feedback.encode("utf-8", "ignore")).hexdigest()[:12],
             )
 
-    options, multiple_sets = _extract_options(lines, _quiz_kind(compact_all))
+    marker = _popup_marker(lines, width, submit)
+    body_lines = lines
+    option_lines = lines
+    if marker and submit:
+        # 选项只属于题型标题下方的弹层，不能借用右侧勾号或底部“回答错误”。
+        body_lines = [line for line in lines if marker.y0 <= line.y0 < submit.y0 - 5
+                      and marker.x0 - 60 <= line.x0 < width * .72]
+        option_lines = [line for line in body_lines if line.y0 >= marker.y1 and
+                        line.x0 < marker.x0 + max(300, width * .22)]
+    options, multiple_sets = _extract_options(option_lines, _quiz_kind(compact_all))
     if len(options) < 2:
         # 没有选项但存在明确题面 + 提交按钮，也可进入作答流程（填空题由人工处理）
         if submit and has_marker:
-            question = _extract_question(lines, None, width, height)
+            question = _extract_question(body_lines, None, width, height)
             return QuizView(
                 detected=True,
                 kind=_quiz_kind(question + compact_all),
                 question=question,
                 submit=submit,
+                options=options,
                 multiple_sets=False,
                 signature=_quiz_signature(question, []),
             )
@@ -1100,7 +1119,7 @@ def detect_quiz(lines: list[OcrLine], width: int, height: int) -> QuizView:
         return QuizView()
 
     kind = _quiz_kind(compact_all + " " + " ".join(o.text for o in options))
-    question = _extract_question(lines, options, width, height)
+    question = _extract_question(body_lines, options, width, height)
     if not question and not has_marker:
         return QuizView()
     return QuizView(
@@ -1200,6 +1219,7 @@ def analyze_page(
     previous_section: str | None = None,
     line_reader: Callable[[np.ndarray], str] | None = None,
     preferred_time: OcrLine | None = None,
+    popup_reader: Callable[[np.ndarray], list[OcrLine]] | None = None,
 ) -> PageView:
     h, w = image.shape[:2]
     view = PageView(width=w, height=h, lines=lines)
@@ -1224,6 +1244,25 @@ def analyze_page(
     )
     if not view.exam.detected:
         view.quiz = detect_quiz(lines, w, h)
+        marker = _popup_marker(lines, w, view.quiz.submit)
+        if (popup_reader and marker and view.quiz.submit and
+                (len(view.quiz.options) < 2 or (view.quiz.kind == "判断题" and
+                 {option.letter for option in view.quiz.options} != {"A", "B"}))):
+            # 全屏 OCR 可能把 A 与讲义背景合并；窄列重扫保留窗口坐标。
+            x0 = max(0, marker.x0 - max(18, marker.height))
+            x1 = min(w, x0 + max(280, marker.height * 11))
+            y0, y1 = marker.y1, view.quiz.submit.y0 - 5
+            if y1 > y0 and x1 > x0:
+                focused = popup_reader(image[y0:y1, x0:x1])
+                rebased = [OcrLine(line.text, line.score, line.x0 + x0, line.y0 + y0,
+                                  line.x1 + x0, line.y1 + y0) for line in focused if
+                           (OPTION_RE.match(normalize_text(line.text)) or
+                            OPTION_SPACE_RE.match(normalize_text(line.text)) or
+                            OPTION_LETTER_RE.match(normalize_text(line.text)) or
+                            compact_text(line.text) in {"正确", "对", "错误", "错"})]
+                lines = lines + rebased
+                view.lines = lines
+                view.quiz = detect_quiz(lines, w, h)
     view.next_button = find_next_button(lines)
     view.resume_button = find_resume_button(lines)
     view.start_button = find_start_button(lines)

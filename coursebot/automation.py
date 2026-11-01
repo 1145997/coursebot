@@ -1426,6 +1426,7 @@ class AutomationWorker(threading.Thread):
         view = analyze_page(
             frame.image, lines, self.current_key, line_reader=self.ocr.line,
             preferred_time=self.time_box if track_time else None,
+            popup_reader=self.ocr.full,
         )
         self.view = view
         self.last_full_scan = time.time()
@@ -2571,18 +2572,20 @@ class AutomationWorker(threading.Thread):
         except Exception:
             return True
 
-    def _read_popup_feedback(self, frame: Frame) -> tuple[str, bool, bool]:
+    def _read_popup_feedback(self, frame: Frame, quiz: QuizView | None = None) -> tuple[str, bool, bool]:
         """只识别弹窗底部一小块反馈区，避免视频画面颜色造成误判。"""
         if not self.ocr:
             return "", False, False
         try:
             h, w = frame.image.shape[:2]
-            # 反馈文字固定在弹窗底部偏右；用识别-only 的小图，约 5ms。
-            crop = frame.image[
-                int(h * 0.805) : int(h * 0.865), int(w * 0.54) : int(w * 0.61)
-            ]
+            if quiz and quiz.submit:
+                button = quiz.submit
+                crop = frame.image[max(0, button.y0 - 8):min(h, button.y1 + 8),
+                                   max(0, button.x0 - int(w * .20)):max(0, button.x0 - 8)]
+            else:
+                crop = frame.image[int(h * .805):int(h * .865), int(w * .54):int(w * .61)]
             text = self.ocr.line(crop) or ""
-            if not text:
+            if not text and not quiz:
                 wide = frame.image[
                     int(h * 0.79) : int(h * 0.88), int(w * 0.50) : int(w * 0.70)
                 ]
@@ -2591,6 +2594,13 @@ class AutomationWorker(threading.Thread):
             return "", False, False
         positive = any(k in text for k in ("回答正确", "答案正确", "答对了", "恭喜"))
         negative = any(k in text for k in ("回答错误", "答案错误", "答错了", "不正确"))
+        if quiz and not positive and not negative and crop.size:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            red = cv2.inRange(hsv, (0, 120, 100), (8, 255, 255)) | cv2.inRange(hsv, (170, 120, 100), (180, 255, 255))
+            green = cv2.inRange(hsv, (40, 100, 80), (90, 255, 255))
+            red_n, green_n = int(np.count_nonzero(red)), int(np.count_nonzero(green))
+            negative = red_n > 80 and red_n > green_n * 2
+            positive = green_n > 80 and green_n > red_n * 2
         return text, positive, negative
 
     def _popup_after_success(self, frame: Frame, old_signature: str) -> QuizView | None:
@@ -2655,6 +2665,51 @@ class AutomationWorker(threading.Thread):
         x = self.window.left + max(8, int(opt.line.x0) - int(42 * scale))
         y = self.window.top + opt.line.cy
         self._click_screen(x, y, f"弹题选项 {opt.letter}")
+
+    def _set_popup_radio(self, quiz: QuizView, letter: str, frame: Frame) -> tuple[Frame, bool]:
+        opt = quiz.option_map().get(letter)
+        if opt is None:
+            return frame, False
+        for attempt in range(2):
+            if self._popup_selected_letters(frame, quiz) == {letter}:
+                self._log(f"已确认选中弹题选项 {letter}")
+                return frame, True
+            if attempt == 0:
+                self._click_popup_option(opt)
+            else:
+                self._click_line(opt.line, f"弹题选项 {letter} 文本")
+            self._sleep(.15)
+            frame = self._grab()
+        confirmed = self._popup_selected_letters(frame, quiz) == {letter}
+        if confirmed:
+            self._log(f"已确认选中弹题选项 {letter}")
+        return frame, confirmed
+
+    def _submit_popup_answer(self, quiz: QuizView) -> tuple[Frame, str, QuizView | None]:
+        """提交后等待新反馈；按钮 OCR 丢失须再确认整张题面，不能直接算答对。"""
+        self._click_line(quiz.submit, "提交弹题答案")
+        self._sleep(.6)
+        for attempt in range(7):
+            frame = self._grab()
+            if not self._popup_submit_present(frame, quiz):
+                found = self._scan(frame, track_time=False).quiz
+                if not found.detected:
+                    return frame, "closed", None
+                if found.options and compact_text(found.question) != compact_text(quiz.question):
+                    return frame, "next", found
+            feedback, positive, negative = self._read_popup_feedback(frame, quiz)
+            if positive:
+                return frame, "correct", None
+            # 切换选项后旧错误提示可能短暂保留，给提交反馈留出更新时间。
+            if negative and attempt >= 3:
+                return frame, "wrong", None
+            self._sleep(.2)
+        found = self._scan(frame, track_time=False).quiz
+        if not found.detected:
+            return frame, "closed", None
+        if found.options and compact_text(found.question) != compact_text(quiz.question):
+            return frame, "next", found
+        return frame, "unknown", found
 
     def _set_popup_combo(
         self, quiz: QuizView, combo: list[str], frame: Frame
@@ -2775,13 +2830,9 @@ class AutomationWorker(threading.Thread):
                     "info",
                 )
                 if current.kind in ("单选题", "判断题"):
-                    # 单选/判断是 radio，点击目标选项即可，不存在“多选取消”问题。
-                    opt = current.option_map().get(combo[0])
-                    if not opt:
-                        self._stop_reason = f"找不到单选项 {combo[0]}"
-                        raise NavigationFailed(self._stop_reason)
-                    self._click_popup_option(opt)
-                    self._sleep(0.03)
+                    frame, state_ok = self._set_popup_radio(current, combo[0], frame)
+                    if not state_ok:
+                        raise NavigationFailed(f"未确认选中弹题选项 {combo[0]}，未提交，也未记为回答错误")
                 else:
                     frame, state_ok = self._set_popup_combo(current, combo, frame)
                     if not state_ok:
@@ -2794,47 +2845,40 @@ class AutomationWorker(threading.Thread):
                 if not submit:
                     self._stop_reason = "弹题未找到提交按钮"
                     raise NavigationFailed(self._stop_reason)
-                self._click_line(submit, f"提交组合 {','.join(combo)}")
-                positive = False
-                negative = False
-                closed = False
-                feedback = ""
-                for _ in range(7):
-                    self._sleep(0.12)
-                    frame = self._grab()
-                    feedback, positive, negative = self._read_popup_feedback(frame)
-                    if positive:
+                for submission in range(2):
+                    frame, result, found = self._submit_popup_answer(current)
+                    if result != "unknown":
                         break
-                    if negative:
+                    self._log(f"组合 {','.join(combo)} 反馈未确认，复核同一组合后重试，不计作错误", "warning")
+                    if submission == 0 and not (found and found.options and found.submit):
                         break
-                    if not self._popup_submit_present(frame, current):
-                        closed = True
-                        break
-                if positive:
+                    if submission == 0:
+                        current = found
+                        if current.kind in ("单选题", "判断题"):
+                            frame, state_ok = self._set_popup_radio(current, combo[0], frame)
+                        else:
+                            frame, state_ok = self._set_popup_combo(current, combo, frame)
+                        if not state_ok:
+                            raise NavigationFailed("重试前未确认选项状态，未继续提交")
+                if result == "unknown":
+                    raise NavigationFailed(f"组合 {','.join(combo)} 已提交但反馈仍未确认；未认定该答案错误")
+                if result == "correct":
                     self._log(f"组合 {','.join(combo)} 回答正确", "success")
                     solved = True
                     break
-                if negative:
+                if result == "wrong":
                     self._log(f"组合 {','.join(combo)} 回答错误，继续下一个", "warning")
                     continue
-                if closed:
+                if result == "closed":
                     self._log(f"组合 {','.join(combo)} 提交后弹窗关闭，视为完成")
                     solved = True
                     break
 
-                # 没读到反馈：可能是弹窗关闭/自动下一题，做一次完整确认
-                view = self._scan(frame)
-                found = view.quiz
-                if not found.detected:
-                    self._log(f"组合 {','.join(combo)} 提交后弹窗关闭，视为完成")
-                    solved = True
-                    break
-                if found.options and found.signature != old_signature:
+                if result == "next":
                     self._log("提交后出现下一道弹题")
                     next_quiz = found
                     solved = True
                     break
-                self._log(f"组合 {','.join(combo)} 未读到对错提示，继续", "warning")
 
             if not solved:
                 self._save_debug(frame, self.view, "quiz_enum_exhausted")
