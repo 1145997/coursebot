@@ -21,6 +21,7 @@ from .capture import ScreenCapture
 from .config import CONFIG_PATH, LOG_DIR, Settings, masked_key
 from .llm import LLMClient
 from .ocr import TextOCR
+from .progress_overlay import ProgressOverlay
 from .vision import analyze_page, annotate_frame, ocr_debug_text, preview_jpeg
 from .windows import (
     Clicker,
@@ -81,6 +82,7 @@ class CourseBotApp:
         self._preview_ocr: TextOCR | None = None
         self._scan_busy = False
         self._last_error_reason = ""
+        self._progress_overlay: ProgressOverlay | None = None
 
         self.dpi = max(96, int(root.winfo_fpixels("1i")))
         self.s = max(1.0, self.dpi / 96.0)
@@ -93,6 +95,7 @@ class CourseBotApp:
         self._populate_settings()
         self.refresh_windows(initial=True)
         self._apply_always_on_top()
+        self._apply_progress_overlay()
         self._append_log("info", "欢迎使用网课自动学习助手。OpenCV 截图 + RapidOCR 识别 + LLM 答题。")
         self._append_log("info", f"按 F8 可随时紧急停止；配置保存在 {CONFIG_PATH}")
         self._append_log("info", "操作顺序：选择浏览器窗口 → 扫描预览确认识别 → 开始自动学习。")
@@ -208,6 +211,7 @@ class CourseBotApp:
         self.var_dry_run = tk.BooleanVar(value=s.dry_run)
         self.var_minimize = tk.BooleanVar(value=s.minimize_on_start)
         self.var_topmost = tk.BooleanVar(value=s.always_on_top)
+        self.var_overlay = tk.BooleanVar(value=s.progress_overlay)
         self.var_preview = tk.BooleanVar(value=s.preview_enabled)
         self.var_debug = tk.BooleanVar(value=s.save_debug_frames)
         self.var_max_sections = tk.StringVar(value=str(s.max_sections))
@@ -413,7 +417,7 @@ class CourseBotApp:
         setting_head = tk.Frame(right, bg=CARD)
         setting_head.grid(row=0, column=0, sticky="ew", padx=self.px(14), pady=(self.px(10), self.px(2)))
         self.label(setting_head, "运行设置", font=self.font_h1).pack(side="left")
-        self.label(setting_head, "改动在下次开始时生效", font=self.font_tiny, fg=MUTED).pack(
+        self.label(setting_head, "悬浮窗/置顶即时生效", font=self.font_tiny, fg=MUTED).pack(
             side="right", pady=self.px(3)
         )
         self.notebook = ttk.Notebook(right)
@@ -490,6 +494,7 @@ class CourseBotApp:
             ("试运行：只识别，不点击鼠标", self.var_dry_run),
             ("开始时最小化本窗口", self.var_minimize),
             ("窗口置顶", self.var_topmost),
+            ("显示运行进度悬浮窗（即时生效）", self.var_overlay),
         ]
         for i, (text, var) in enumerate(checks):
             cb = tk.Checkbutton(
@@ -507,14 +512,15 @@ class CourseBotApp:
                 anchor="w",
                 padx=0,
                 pady=self.px(1),
-                command=self._on_check_change if var is self.var_topmost else None,
+                command=(self._on_overlay_toggle if var is self.var_overlay else
+                         self._on_check_change if var is self.var_topmost else None),
             )
             cb.grid(row=i, column=0, sticky="w", pady=self.px(2))
-        self._separator(f, 6)
-        self._field_row(f, 7, "最多连续学习", self.var_max_sections, "节")
-        self._field_row(f, 8, "无进度判定", self.var_stall, "秒后尝试恢复")
-        self._field_row(f, 9, "结束判定余量", self.var_margin, "秒")
-        self._field_row(f, 10, "答题重试次数", self.var_quiz_retry, "次")
+        self._separator(f, 7)
+        self._field_row(f, 8, "最多连续学习", self.var_max_sections, "节")
+        self._field_row(f, 9, "无进度判定", self.var_stall, "秒后尝试恢复")
+        self._field_row(f, 10, "结束判定余量", self.var_margin, "秒")
+        self._field_row(f, 11, "答题重试次数", self.var_quiz_retry, "次")
         self.label(
             f,
             "提示：首次使用建议勾选“试运行”，先观察预览与日志里的定位是否正确。",
@@ -522,7 +528,7 @@ class CourseBotApp:
             fg=MUTED,
             wraplength=self.px(330),
             justify="left",
-        ).grid(row=11, column=0, sticky="w", pady=(self.px(10), 0))
+        ).grid(row=12, column=0, sticky="w", pady=(self.px(10), 0))
 
     def _build_llm_tab(self) -> None:
         f = self.tab_llm
@@ -785,6 +791,7 @@ class CourseBotApp:
         self.var_dry_run.set(s.dry_run)
         self.var_minimize.set(s.minimize_on_start)
         self.var_topmost.set(s.always_on_top)
+        self.var_overlay.set(s.progress_overlay)
         self.var_preview.set(s.preview_enabled)
         self.var_debug.set(s.save_debug_frames)
         self.var_max_sections.set(str(s.max_sections))
@@ -829,6 +836,7 @@ class CourseBotApp:
         s.dry_run = bool(self.var_dry_run.get())
         s.minimize_on_start = bool(self.var_minimize.get())
         s.always_on_top = bool(self.var_topmost.get())
+        s.progress_overlay = bool(self.var_overlay.get())
         s.preview_enabled = bool(self.var_preview.get())
         s.save_debug_frames = bool(self.var_debug.get())
         s.max_sections = int(num(self.var_max_sections, "最多连续学习", s.max_sections, 1, 500, int))
@@ -882,6 +890,7 @@ class CourseBotApp:
         self.settings = Settings()
         self._populate_settings()
         self._apply_always_on_top()
+        self._apply_progress_overlay()
         self._append_log("warning", "已恢复默认设置（尚未保存到文件）")
 
     def _toggle_key(self) -> None:
@@ -898,6 +907,48 @@ class CourseBotApp:
 
     def _on_check_change(self) -> None:
         self._apply_always_on_top()
+
+    def _on_overlay_toggle(self) -> None:
+        self.settings.progress_overlay = bool(self.var_overlay.get())
+        self._apply_progress_overlay()
+        try:
+            # 只保存该界面选项，不提前应用尚未开始的其它表单改动。
+            saved = Settings.load()
+            saved.progress_overlay = self.settings.progress_overlay
+            saved.save()
+        except Exception as exc:
+            self._append_log("error", f"悬浮窗设置保存失败：{exc}")
+
+    def _hide_progress_overlay(self) -> None:
+        self.var_overlay.set(False)
+        self._on_overlay_toggle()
+
+    def _show_main_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _apply_progress_overlay(self) -> None:
+        if not self.var_overlay.get():
+            if self._progress_overlay is not None:
+                self._progress_overlay.hide()
+            return
+        created = self._progress_overlay is None
+        if created:
+            self._progress_overlay = ProgressOverlay(
+                self.root, self.s, self._show_main_window, self.stop, self._hide_progress_overlay)
+        self._sync_progress_overlay()
+        self._progress_overlay.show()
+        if created and not self._progress_overlay.capture_excluded:
+            self._append_log("warning", "系统未启用悬浮窗截图排除，请将悬浮窗移出课程正文区域")
+
+    def _sync_progress_overlay(self) -> None:
+        if self._progress_overlay is not None:
+            self._progress_overlay.update(
+                text=str(self.state_text.cget("text")), color=str(self.status_dot.cget("fg")),
+                clock=str(self.time_text.cget("text")), percent=float(self.progress["value"]),
+                stats=str(self.stats_text.cget("text")), running=self.running,
+                stopping=self.running and self.stop_event.is_set())
 
     # ------------------------------------------------------------------ 窗口
     def refresh_windows(self, initial: bool = False) -> None:
@@ -1163,6 +1214,11 @@ class CourseBotApp:
         self.stop_btn.configure(state="normal", bg="#3a1720")
         self.start_btn.configure(state="disabled", bg="#244b36", text="运行中…")
         self.running = True
+        self.state_text.configure(text="正在启动…")
+        self.time_text.configure(text="--:-- / --:--", fg=MUTED)
+        self.progress.configure(value=0)
+        self.status_dot.configure(fg=BLUE)
+        self._apply_progress_overlay()
         self._append_log(
             "info",
             f"开始自动学习：{win.label()}；{'试运行（不点击）' if self.settings.dry_run else '真实点击模式'}",
@@ -1210,6 +1266,8 @@ class CourseBotApp:
         self.stop_btn.configure(state="disabled", text="停止中…")
         self.header_status.configure(text="正在停止…", fg=WARN)
         self.status_dot.configure(fg=WARN)
+        self.state_text.configure(text="正在停止…")
+        self._sync_progress_overlay()
 
     def _on_worker_stopped(self, reason: str) -> None:
         self.running = False
@@ -1219,6 +1277,7 @@ class CourseBotApp:
         self.header_status.configure(text="已停止" if "出错" not in reason else "异常停止", fg=MUTED)
         self.state_text.configure(text="已停止" if "出错" not in reason else "异常停止")
         self.status_dot.configure(fg=MUTED)
+        self._sync_progress_overlay()
         try:
             self.root.deiconify()
             self.root.lift()
@@ -1342,6 +1401,8 @@ class CourseBotApp:
                     pass
         elif kind == "stopped":
             self._on_worker_stopped(str(msg.get("reason", "")))
+        if kind in {"status", "stats"}:
+            self._sync_progress_overlay()
 
     # ------------------------------------------------------------------ 其它
     def test_mouse_input(self) -> None:

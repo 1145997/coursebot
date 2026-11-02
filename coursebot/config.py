@@ -65,6 +65,7 @@ class Settings:
     dry_run: bool = False
     minimize_on_start: bool = True
     always_on_top: bool = False
+    progress_overlay: bool = False
     save_debug_frames: bool = True
     preview_enabled: bool = True
     show_ocr_boxes: bool = True
