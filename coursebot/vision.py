@@ -95,6 +95,7 @@ class QuizOption:
     text: str
     line: OcrLine
     selected: bool = False
+    control_center: tuple[int, int] | None = None
 
 
 @dataclass
@@ -682,18 +683,20 @@ def _read_band_text(
     y1: int,
     line_reader: Callable[[np.ndarray], str] | None,
     fallback_lines: list[OcrLine],
+    left_edge: int | None = None,
 ) -> str:
     h, w = image.shape[:2]
+    scale = max(.65, q.start.height / 28)
+    left = max(0, left_edge if left_edge is not None else q.start.x0 + min(65, int(58 * scale)))
+    right = min(w, int(w * .72), q.start.x0 + 880)
     if line_reader is None:
         text = ""
         for line in fallback_lines:
-            if y0 - 5 <= line.cy <= y1 + 5 and line.x0 > q.start.x0 + 45:
+            if y0 - 5 <= line.cy <= y1 + 5 and left <= line.x0 and line.x1 <= right:
                 text = line.text
                 break
         return _clean_option_text(text)
 
-    left = max(0, q.start.x0 + 45)
-    right = min(w, q.start.x0 + 880)
     if right <= left:
         return ""
     gray = cv2.cvtColor(image[max(0, y0 - 2):min(h, y1 + 2), left:right], cv2.COLOR_BGR2GRAY)
@@ -702,12 +705,12 @@ def _read_band_text(
         return ""
     x_min = left + int(xs.min())
     x_max = left + int(xs.max())
-    y_top = max(0, y0 - 7)
-    y_bottom = min(h, y1 + 8)
+    y_top = max(0, y0 - 2 + int(ys.min()) - 5)
+    y_bottom = min(h, y0 - 2 + int(ys.max()) + 6)
     attempts = [
-        (max(0, x_min - 8), min(w, x_max + 12)),
-        (max(0, x_min - 20), min(w, x_max + 35)),
-        (left, min(w, left + 700)),
+        (max(left, x_min - 8), min(right, x_max + 12)),
+        (max(left, x_min - 20), min(right, x_max + 35)),
+        (left, min(right, left + 700)),
     ]
     best = ""
     for lx, rx in attempts:
@@ -719,17 +722,18 @@ def _read_band_text(
             best = text
     if not best:
         for line in fallback_lines:
-            if y0 - 5 <= line.cy <= y1 + 5 and line.x0 > q.start.x0 + 45:
+            if y0 - 5 <= line.cy <= y1 + 5 and left <= line.x0 and line.x1 <= right:
                 best = _clean_option_text(line.text)
                 if best:
                     break
     return best
 
 
-def _option_selected(image: np.ndarray, q: ExamQuestion, center_y: int) -> bool:
+def _option_selected(image: np.ndarray, q: ExamQuestion, center_y: int,
+                     center_x: int | None = None) -> bool:
     h, w = image.shape[:2]
-    x0 = max(0, q.start.x0 + 2)
-    x1 = min(w, q.start.x0 + 58)
+    x0 = max(0, center_x - 18 if center_x is not None else q.start.x0 + 2)
+    x1 = min(w, center_x + 18 if center_x is not None else q.start.x0 + 58)
     y0 = max(0, center_y - 18)
     y1 = min(h, center_y + 18)
     patch = image[y0:y1, x0:x1]
@@ -740,6 +744,34 @@ def _option_selected(image: np.ndarray, q: ExamQuestion, center_y: int) -> bool:
     r = patch[:, :, 2].astype(np.int16)
     blue = (b > 165) & (b > r + 55) & (g > r + 15) & (g < 235)
     return float(blue.mean()) > 0.10
+
+
+def selected_exam_options(image: np.ndarray, q: ExamQuestion) -> set[str]:
+    return {opt.letter for opt in q.options if _option_selected(
+        image, q, opt.control_center[1] if opt.control_center else opt.line.cy,
+        opt.control_center[0] if opt.control_center else None)}
+
+
+def _exam_control_rows(image: np.ndarray, q: ExamQuestion, next_y: int) -> list[tuple[int, int, int, int, int]]:
+    """正文圆形选项提供行位置；短数字不再依赖连续深色像素行数。"""
+    h, w = image.shape[:2]
+    scale = max(.65, min(1.6, q.start.height / 28))
+    expected_x = q.start.x0 + 27 * scale
+    x0, x1 = max(0, int(expected_x - 38 * scale)), min(w, int(expected_x + 38 * scale))
+    y0, y1 = max(0, q.start.y1 + 12), min(h, next_y - 5)
+    if x1 <= x0 or y1 <= y0:
+        return []
+    gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, max(24, int(35 * scale)),
+                              param1=45, param2=14, minRadius=max(7, int(8 * scale)),
+                              maxRadius=max(18, int(30 * scale)))
+    if circles is None:
+        return []
+    centers = sorted(((int(round(x + x0)), int(round(y + y0)), int(round(radius)))
+                      for x, y, radius in circles[0]
+                      if abs(x + x0 - expected_x) <= max(9, 12 * scale)), key=lambda c: c[1])
+    half = max(12, int(min(q.start.height, 40) * .65))
+    return [(max(y0, cy - half), min(y1, cy + half), cx, cy, radius) for cx, cy, radius in centers]
 
 
 def _build_exam_questions(
@@ -753,10 +785,13 @@ def _build_exam_questions(
     result: list[ExamQuestion] = []
     for i, q in enumerate(starts):
         next_y = starts[i + 1].start.y0 if i + 1 < len(starts) else height - 20
-        bands = _row_bands(image, q, next_y, width)
+        bands = _exam_control_rows(image, q, next_y)
+        control_rows = bool(bands)
+        if not bands:
+            bands = [(b0, b1, None, None, None) for b0, b1 in _row_bands(image, q, next_y, width)]
         options: list[QuizOption] = []
         option_idx = 0
-        for b0, b1 in bands:
+        for b0, b1, cx, cy, radius in bands:
             if b0 < q.start.y1 + 25:
                 continue
             band_h = b1 - b0
@@ -767,7 +802,8 @@ def _build_exam_questions(
             if q.kind != "判断题" and option_idx >= 6:
                 break
             text = "" if q.kind == "判断题" else _read_band_text(
-                image, q, b0, b1, line_reader, lines
+                image, q, b0, b1, line_reader, lines,
+                left_edge=cx + radius + 5 if cx is not None else None,
             )
             if not text and q.kind == "判断题":
                 text = "对" if option_idx == 0 else "错"
@@ -775,6 +811,10 @@ def _build_exam_questions(
                 k in compact_text(text)
                 for k in ("暂时保存", "提交", "题量", "满分", "ai讲解", "上一节", "下一节")
             ):
+                if control_rows:
+                    # 真实圆钮已经占据一个选项位置；漏字不能让后续 B/C 被改成 A/B。
+                    option_idx += 1
+                    q.complete = False
                 continue
             # 题型小标题（如“二、多选题（共1题）”）不是选项，不能占 E 位。
             if re.match(
@@ -798,17 +838,20 @@ def _build_exam_questions(
                 x1=min(width - 2, q.start.x0 + 650),
                 y1=b1,
             )
-            selected = _option_selected(image, q, (b0 + b1) // 2)
-            options.append(QuizOption(letter, text, line, selected=selected))
+            selected = _option_selected(image, q, cy if cy is not None else (b0 + b1) // 2, cx)
+            options.append(QuizOption(letter, text, line, selected=selected,
+                                      control_center=(cx, cy) if cx is not None else None))
             option_idx += 1
+        q.options = options
         if len(options) >= 2:
-            q.options = options
             last_bottom = max(o.line.y1 for o in options)
             if last_bottom > height - 55:
                 q.complete = False
             if q.kind in ("单选题", "多选题") and len(options) < 4 and last_bottom > height - 130:
                 q.complete = False
-            result.append(q)
+        else:
+            q.complete = False
+        result.append(q)
     return result
 
 

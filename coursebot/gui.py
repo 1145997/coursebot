@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import copy
 import json
 import os
 import queue
@@ -713,6 +714,12 @@ class CourseBotApp:
             wraplength=self.px(330),
             justify="left",
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(self.px(8), 0))
+        self.verify_exam_btn = self.button(
+            f, "核验并提交已作答测验", lambda: self.start(verify_exam_only=True),
+            "secondary", font=self.font_tiny)
+        self.verify_exam_btn.grid(row=9, column=0, columnspan=2, sticky="w", pady=(self.px(8), 0))
+        self.label(f, "保留已有选择，不调用模型；仍有未选题时不提交。",
+                   font=self.font_tiny, fg=MUTED).grid(row=10, column=0, columnspan=2, sticky="w")
 
     def _separator(self, parent: tk.Widget, row: int) -> None:
         line = tk.Frame(parent, bg=BORDER, height=1)
@@ -1191,7 +1198,7 @@ class CourseBotApp:
             self.queue.put({"type": "llm_test", "ok": False, "error": str(exc)})
 
     # ------------------------------------------------------------------ 运行控制
-    def start(self) -> None:
+    def start(self, *, verify_exam_only: bool = False) -> None:
         if self.running:
             return
         win = self.selected_window
@@ -1201,7 +1208,7 @@ class CourseBotApp:
         if not self._collect_settings(strict=True):
             return
         if (
-            self.settings.auto_quiz
+            not verify_exam_only and self.settings.auto_quiz
             and self.settings.llm_mode != "local"
             and not self.settings.api_key
         ):
@@ -1221,6 +1228,7 @@ class CourseBotApp:
         self.stats_text.configure(text="本次完成 0 节 · 自动答题 0 题")
         self.stop_btn.configure(state="normal", bg="#3a1720")
         self.start_btn.configure(state="disabled", bg="#244b36", text="运行中…")
+        self.verify_exam_btn.configure(state="disabled")
         self.running = True
         self.state_text.configure(text="正在启动…")
         self.time_text.configure(text="--:-- / --:--", fg=MUTED)
@@ -1229,7 +1237,7 @@ class CourseBotApp:
         self._apply_progress_overlay()
         self._append_log(
             "info",
-            f"开始自动学习：{win.label()}；{'试运行（不点击）' if self.settings.dry_run else '真实点击模式'}",
+            f"{'核验已有测验选择' if verify_exam_only else '开始自动学习'}：{win.label()}；{'试运行（不点击）' if self.settings.dry_run else '真实点击模式'}",
         )
         focus_window(win.hwnd)
         overlap = self._root_overlaps(win)
@@ -1240,7 +1248,8 @@ class CourseBotApp:
             self.root.after(900, self._minimize_self)
         if self.settings.dry_run:
             self._append_log("dry", "试运行：日志中的“将点击”不会实际移动鼠标。")
-        self.worker = AutomationWorker(self.settings, win, self.queue, self.stop_event)
+        self.worker = AutomationWorker(copy.copy(self.settings), win, self.queue, self.stop_event,
+                                       verify_exam_only=verify_exam_only)
         self.worker.start()
 
     def _minimize_self(self) -> None:
@@ -1281,6 +1290,7 @@ class CourseBotApp:
         self.running = False
         self._last_error_reason = reason
         self.start_btn.configure(state="normal", bg=ACCENT, text="开始自动学习")
+        self.verify_exam_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled", text="停止  F8")
         self.header_status.configure(text="已停止" if "出错" not in reason else "异常停止", fg=MUTED)
         self.state_text.configure(text="已停止" if "出错" not in reason else "异常停止")

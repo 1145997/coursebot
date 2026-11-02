@@ -9,7 +9,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,7 @@ from .vision import (
     parse_time_text,
     pick_next_section,
     preview_jpeg,
+    selected_exam_options,
 )
 from .windows import (
     Clicker,
@@ -66,6 +67,20 @@ class ForegroundRecheck(BaseException):
     """前台等待后撤销待执行动作；不得被鼠标/测验的普通失败重试吞掉。"""
 
 
+@dataclass
+class ExamProgress:
+    total: int | None = None
+    answered: dict[str, set[str]] = field(default_factory=dict)
+    plans: dict[str, list[str]] = field(default_factory=dict)
+    counted: set[str] = field(default_factory=set)
+    seen: set[str] = field(default_factory=set)
+    selection_failures: dict[str, int] = field(default_factory=dict)
+
+    def missing(self) -> list[str]:
+        last = self.total or max((int(n) for n in self.seen if n.isdigit()), default=0)
+        return [str(n) for n in range(1, last + 1) if str(n) not in self.answered]
+
+
 class AutomationWorker(threading.Thread):
     def __init__(
         self,
@@ -73,9 +88,11 @@ class AutomationWorker(threading.Thread):
         window: WindowInfo,
         out_queue: queue.Queue,
         stop_event: threading.Event,
+        *, verify_exam_only: bool = False,
     ):
         super().__init__(daemon=True, name="coursebot-automation")
         self.settings = settings
+        self.verify_exam_only = verify_exam_only
         self.window = window
         self.queue = out_queue
         self.stop_event = stop_event
@@ -267,6 +284,9 @@ class AutomationWorker(threading.Thread):
             if self.settings.dry_run:
                 self._log("试运行模式：只识别、不点击", "warning")
             self._preflight()
+            if self.verify_exam_only:
+                self._verify_answered_exam()
+                return
             try:
                 self._start()
             except ForegroundRecheck:
@@ -284,6 +304,26 @@ class AutomationWorker(threading.Thread):
         finally:
             self._cleanup()
             self._emit("stopped", reason=self._stop_reason)
+
+    def _verify_answered_exam(self) -> None:
+        """用户已作答测验的独立核验入口；不调用 LLM，也不改动选项。"""
+        while not self.stop_event.is_set():
+            try:
+                if self.capture is None:
+                    self._prepare_window_capture()
+                self._status("exam", "核验已有选择，完整后提交本节测验")
+                frame = self._scroll_exam_to_top()
+                view = self._scan(frame)
+                if not view.exam.detected:
+                    raise NavigationFailed("当前页未识别到章节测验，未提交")
+                self._handle_exam(view, frame)
+                if not self._chapter_quiz_done:
+                    raise NavigationFailed("尚未确认测验提交成功")
+                self._stop_reason = "本节测验已核验完成，保留原有选择；未进入下一节"
+                return
+            except ForegroundRecheck:
+                self._log("前台已恢复，重新核验已有选择", "warning")
+        raise StopAutomation()
 
     def _cleanup(self) -> None:
         if self._browser_reader:
@@ -310,7 +350,7 @@ class AutomationWorker(threading.Thread):
             self._log("自动答题已关闭", "warning")
         self._log(f"识别引擎就绪，日志：{self.log_file}")
 
-    def _start(self) -> None:
+    def _prepare_window_capture(self) -> None:
         countdown = max(0, int(self.settings.start_countdown))
         if countdown:
             for n in range(countdown, 0, -1):
@@ -336,6 +376,9 @@ class AutomationWorker(threading.Thread):
         ):
             self._log("目标窗口未完全显示在屏幕内，部分识别/点击可能失败", "warning")
         self._log(f"窗口客户区：{self.window.width}×{self.window.height} @ ({self.window.left},{self.window.top})")
+
+    def _start(self) -> None:
+        self._prepare_window_capture()
         self._status("scanning", "正在扫描页面…")
         if self.settings.video_engine == "accessibility":
             self._browser_reader = BrowserAccessibility(self.window)
@@ -1135,6 +1178,9 @@ class AutomationWorker(threading.Thread):
         if not snapshot.complete or not snapshot.page_key:
             self._status("scanning", "等待完整目录后再选择待办", duration=0)
             return True
+        if not self.settings.auto_next:
+            self._stop_reason = "本节任务已完成（自动切换已关闭）"
+            raise StopAutomation()
         if self.settings.dry_run:
             self._stop_reason = "试运行不切换橙色目录"
             raise StopAutomation()
@@ -2114,7 +2160,7 @@ class AutomationWorker(threading.Thread):
         self._chapter_quiz_done = True
 
     def _restart_exam_after_incomplete(
-        self, view: PageView, frame: Frame, depth: int
+        self, view: PageView, frame: Frame, depth: int, progress: ExamProgress | None = None
     ) -> bool:
         self._exam_incomplete_rescan = False
         if depth >= 2:
@@ -2129,27 +2175,29 @@ class AutomationWorker(threading.Thread):
         )
         self.exam_active = False
         try:
-            return self._handle_exam(view, frame, _rescan_depth=depth + 1)
+            return self._handle_exam(view, frame, _rescan_depth=depth + 1, _progress=progress)
         finally:
             self.exam_active = True
 
     def _handle_exam(
-        self, view: PageView, frame: Frame, _rescan_depth: int = 0
+        self, view: PageView, frame: Frame, _rescan_depth: int = 0,
+        _progress: ExamProgress | None = None,
     ) -> bool:
         if self.exam_active:
             return True
-        if not self.settings.auto_quiz:
+        if not self.settings.auto_quiz and not self.verify_exam_only:
             self._log("检测到章节测验，但自动答题已关闭；为避免跳过测验，自动化停止", "warning")
             self._stop_reason = "章节测验需要人工完成（自动答题已关闭）"
             raise StopAutomation()
         self.exam_active = True
+        progress = _progress if _progress is not None else ExamProgress()
         try:
             if view.exam.result:
                 score = self._exam_score(view)
                 if not self._chapter_quiz_done:
                     self._log(f"章节测验已提交完成{('：' + score) if score else ''}", "success")
                 self._chapter_quiz_done = True
-                self._status("exam", "章节测验已完成，准备下一节")
+                self._status("exam", "章节测验已完成" if self.verify_exam_only else "章节测验已完成，准备下一节")
                 return True
             self._status("exam", "准备章节测验…")
             self._save_debug(frame, view, "exam_start")
@@ -2158,7 +2206,7 @@ class AutomationWorker(threading.Thread):
                 view = self._confirm_exam(view)
                 if self._exam_incomplete_rescan:
                     return self._restart_exam_after_incomplete(
-                        view, frame, _rescan_depth
+                        view, frame, _rescan_depth, progress
                     )
                 if view.exam.result:
                     self._log(f"章节测验已提交完成：{self._exam_score(view)}", "success")
@@ -2169,8 +2217,9 @@ class AutomationWorker(threading.Thread):
             # 不能只固定上滚 24 格：很长的测验可能滚不到顶，会漏掉上半部分题目。
             frame = self._scroll_exam_to_top()
             view = self._scan(frame)
-            total = view.exam.total
-            answered: dict[str, set[str]] = {}
+            total = view.exam.total or progress.total
+            progress.total = total
+            answered = progress.answered
             self._log(
                 f"章节测验开始：识别到题量 {total if total is not None else '未知'}"
             )
@@ -2184,7 +2233,7 @@ class AutomationWorker(threading.Thread):
                     view = self._confirm_exam(view)
                     if self._exam_incomplete_rescan:
                         return self._restart_exam_after_incomplete(
-                            view, frame, _rescan_depth
+                            view, frame, _rescan_depth, progress
                         )
                     if view.exam.result:
                         score = self._exam_score(view)
@@ -2224,11 +2273,12 @@ class AutomationWorker(threading.Thread):
                         view = self._scan(frame)
                         continue
                 total = view.exam.total or total
+                progress.total = total
                 visible = view.exam.questions
                 solved_here = 0
+                selection_retry = False
                 for q in visible:
-                    if q.key in answered:
-                        continue
+                    progress.seen.add(q.key)
                     if not q.complete:
                         continue
                     if len(q.options) < 2:
@@ -2240,6 +2290,17 @@ class AutomationWorker(threading.Thread):
                         raise NavigationFailed(self._stop_reason)
                     if not q.text:
                         continue
+                    existing = {opt.letter for opt in q.options if opt.selected}
+                    if existing and (q.kind == "多选题" or len(existing) == 1):
+                        if answered.get(q.key) != existing:
+                            self._log(f"第 {q.number} 题已有选择 {','.join(sorted(existing))}，保留并核验，不重复作答")
+                        answered[q.key] = existing
+                        progress.plans[q.key] = sorted(existing)
+                        progress.counted.add(q.key)
+                        continue
+                    answered.pop(q.key, None)
+                    if self.verify_exam_only:
+                        continue
                     options = {o.letter: o.text for o in q.options}
                     self._status(
                         "exam",
@@ -2249,25 +2310,44 @@ class AutomationWorker(threading.Thread):
                         f"章节测验第 {q.number} 题【{q.kind}】：{q.text[:160]}"
                     )
                     self._log("选项：" + " | ".join(f"{k}.{v[:45]}" for k, v in options.items()))
+                    answer = None
                     try:
-                        answer = self.llm.solve(q.text, options, kind=q.kind)
+                        if q.key in progress.plans:
+                            letters = [x for x in progress.plans[q.key] if x in options]
+                        else:
+                            answer = self.llm.solve(q.text, options, kind=q.kind)
+                            letters = [x for x in answer.letters if x in options]
                     except LLMError as exc:
                         self._log(f"LLM 答题失败：{exc}", "error")
                         self._save_debug(frame, view, f"exam_llm_error_{q.number}")
                         self._stop_reason = f"章节测验 LLM 答题失败：{exc}"
                         raise NavigationFailed(self._stop_reason) from exc
-                    letters = [x for x in answer.letters if x in options]
                     if not letters:
-                        self._log(f"LLM 答案 {answer.letters} 不在选项 {list(options)} 中", "error")
+                        self._log(f"答案不在选项 {list(options)} 中", "error")
                         self._stop_reason = "章节测验 LLM 答案与选项不匹配"
                         raise NavigationFailed(self._stop_reason)
-                    self._select_exam_options(q, letters)
+                    progress.plans[q.key] = list(letters)
+                    if not self._select_exam_options(q, letters):
+                        failures = progress.selection_failures.get(q.key, 0) + 1
+                        progress.selection_failures[q.key] = failures
+                        self._log(f"第 {q.number} 题未确认选中，重新读取（{failures}/3），不计作已答", "warning")
+                        if failures >= 3:
+                            self._save_debug(frame, view, f"exam_selection_unconfirmed_{q.number}")
+                            raise NavigationFailed(f"第 {q.number} 题连续三次未确认选中，未提交")
+                        frame = self._grab()
+                        view = self._scan(frame)
+                        selection_retry = True
+                        break
                     answered[q.key] = set(letters)
-                    self.quizzes_solved += 1
+                    if q.key not in progress.counted:
+                        self.quizzes_solved += 1
+                        progress.counted.add(q.key)
+                        self._emit("stats", sections=self.sections_finished, quizzes=self.quizzes_solved)
                     solved_here += 1
-                    reason = f"；{answer.reason}" if answer.reason else ""
+                    explanation = getattr(answer, "reason", "沿用已确认的选择")
+                    reason = f"；{explanation}" if explanation else ""
                     self._log(
-                        f"第 {q.number} 题选择 {','.join(letters)}（{answer.latency:.1f}s）{reason}",
+                        f"第 {q.number} 题选择 {','.join(letters)}（{getattr(answer, 'latency', 0):.1f}s）{reason}",
                         "success",
                     )
                     self._emit(
@@ -2275,11 +2355,15 @@ class AutomationWorker(threading.Thread):
                         question=f"{q.number}【{q.kind}】{q.text}"[:500],
                         options=options,
                         answer=letters,
-                        reason=answer.reason,
-                        confidence=answer.confidence,
+                        reason=explanation,
+                        confidence=getattr(answer, "confidence", None),
                     )
                     self._sleep(0.08)
 
+                if selection_retry:
+                    previous_sig = previous_frame = None
+                    stable_scrolls = 0
+                    continue
                 if solved_here:
                     # 选项选中会改变画面；重新取一帧作为“滚动前基准”，
                     # 避免把选中状态误判成页面仍在滚动。
@@ -2330,30 +2414,25 @@ class AutomationWorker(threading.Thread):
 
                 submit = view.exam.submit
                 if submit and stable_scrolls >= 2:
-                    if total is not None and len(answered) < total:
-                        missing_numbers = [
-                            str(n)
-                            for n in range(1, total + 1)
-                            if str(n) not in answered
-                        ]
+                    missing_numbers = progress.missing()
+                    if missing_numbers:
                         self._log(
                             f"自检发现只答了 {len(answered)}/{total} 题，"
                             f"缺第 {', '.join(missing_numbers[:8])} 题",
                             "warning",
                         )
-                        if _rescan_depth < 1:
+                        if _rescan_depth < 2:
                             self._log(
                                 "提交前先从顶部重新扫描，尝试补齐漏题",
                                 "warning",
                             )
                             return self._restart_exam_after_incomplete(
-                                view, frame, _rescan_depth
+                                view, frame, _rescan_depth, progress
                             )
-                        self._log(
-                            "已重扫一次仍缺题，先提交并检查平台提示",
-                            "warning",
-                        )
+                        raise NavigationFailed(f"章节测验仍缺第 {', '.join(missing_numbers)} 题，未提交；已保留已有选择")
                     else:
+                        if not answered:
+                            raise NavigationFailed("未确认任何题目的选中状态，未提交")
                         self._log(
                             f"已到页面底部，共答 {len(answered)} 题，点击提交"
                         )
@@ -2361,7 +2440,7 @@ class AutomationWorker(threading.Thread):
                     frame, view = self._submit_exam(view, frame)
                     if self._exam_incomplete_rescan:
                         return self._restart_exam_after_incomplete(
-                            view, frame, _rescan_depth
+                            view, frame, _rescan_depth, progress
                         )
                     if view.exam.result:
                         score = self._exam_score(view)
@@ -2408,31 +2487,37 @@ class AutomationWorker(threading.Thread):
             self._no_time_since = None
             self._emit("stats", sections=self.sections_finished, quizzes=self.quizzes_solved)
 
-    def _select_exam_options(self, q: ExamQuestion, letters: list[str]) -> None:
+    def _select_exam_options(self, q: ExamQuestion, letters: list[str]) -> bool:
         desired = set(letters)
         option_map = {o.letter: o for o in q.options}
-        if q.kind == "多选题":
+        for _attempt in range(2):
+            if q.kind == "多选题":
+                for opt in q.options:
+                    if (opt.letter in desired) != opt.selected:
+                        self._click_exam_option(q, opt)
+                        self._sleep(0.05)
+            else:
+                for letter in letters:
+                    opt = option_map.get(letter)
+                    if opt and not opt.selected:
+                        self._click_exam_option(q, opt)
+                        break
+            self._sleep(.2)
+            observed = selected_exam_options(self._grab().image, q)
             for opt in q.options:
-                want = opt.letter in desired
-                if want != opt.selected:
-                    self._click_exam_option(q, opt)
-                    self._sleep(0.05)
-            return
-        for letter in letters:
-            opt = option_map.get(letter)
-            if not opt:
-                continue
-            if opt.selected:
-                self._log(f"第 {q.number} 题选项 {letter} 已被选中，跳过点击")
-                continue
-            self._click_exam_option(q, opt)
-            self._sleep(0.05)
-            break
+                opt.selected = opt.letter in observed
+            if observed == desired:
+                return True
+        return False
 
     def _click_exam_option(self, q: ExamQuestion, opt) -> None:
-        scale = max(0.8, q.start.height / 28.0)
-        x = self.window.left + q.start.x0 + int(27 * scale)
-        y = self.window.top + opt.line.cy
+        if opt.control_center is not None:
+            x = self.window.left + opt.control_center[0]
+            y = self.window.top + opt.control_center[1]
+        else:
+            scale = max(0.8, min(1.4, q.start.height / 28.0))
+            x = self.window.left + q.start.x0 + int(27 * scale)
+            y = self.window.top + opt.line.cy
         self._click_screen(x, y, f"章节测验第 {q.number} 题选项 {opt.letter}")
 
     def _confirm_exam(self, view: PageView) -> PageView:

@@ -101,7 +101,7 @@ class TextOCR:
             if self._full is None:
                 self._full = RapidOCR(use_angle_cls=False)
             if self._line is None:
-                self._line = RapidOCR(use_text_det=False, use_angle_cls=False)
+                self._line = RapidOCR(use_text_det=False, use_angle_cls=False, text_score=0.1)
 
     def warmup(self) -> None:
         self._ensure()
@@ -175,5 +175,14 @@ class TextOCR:
             return ""
         if not result:
             return ""
-        texts = [normalize_text(str(item[1])) for item in result if len(item) >= 2]
+        texts = []
+        for item in result:
+            if len(item) < 3:
+                continue
+            text = normalize_text(str(item[1]))
+            score = float(item[2])
+            # 单个数字常因半角/全角候选分摊概率而低于 0.5；只放宽明确数字。
+            numeric = bool(re.fullmatch(r"[+−-]?\d+(?:[.,/]\d+)*(?:[%％])?", text))
+            if score >= .5 or (numeric and score >= .2):
+                texts.append(text)
         return " ".join(t for t in texts if t).strip()
