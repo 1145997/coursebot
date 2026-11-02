@@ -1,4 +1,4 @@
-CourseBot v2.0.0-dev.8  Windows 本地测试版
+CourseBot v2.0.0-dev.8  Windows 预发布版
 =================================
 
 一、怎么启动

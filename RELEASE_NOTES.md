@@ -1,4 +1,8 @@
-# CourseBot v2.0.0-dev.8（本地开发版）
+# CourseBot v2.0.0-dev.8（预发布版）
+
+发布日期：2026-11-02。相对上一公开版本 dev.4，包含 dev.5 至 dev.8 的进度悬浮窗、前台等待恢复、弹题合框及章节测验漏题修复。
+
+[下载 v2.0.0-dev.8](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.8)。独立 Windows 客户端已完成六题测验的已有选择核验及提交；未改动原有选择，成功后停留本节结果页。
 
 - 修复单个数字选项被 OCR 默认阈值过滤的问题；只对明确数字放宽置信度，普通文字保持原阈值。
 - 选项补读限制在正文范围，禁止从同高度的右侧目录借字；按真实圆钮定位选项行，未读出的行保留占位，不让后续选项错位。
@@ -95,4 +99,4 @@ python -m unittest discover -s tests -v
 
 本版保留开发版本号，作为预发布版提供 Windows 免安装包、源码包和 SHA256 校验文件。其他平台、页面布局和题型未作全面验证。
 
-[下载 v2.0.0-dev.4](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.4)
+[下载当前预发布版 v2.0.0-dev.8](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.8)

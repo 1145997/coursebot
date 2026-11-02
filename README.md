@@ -1,8 +1,8 @@
 # 网课自动学习助手（CourseBot）v2.0.0-dev.8
 
-> 当前开发版 dev.8 修复章节测验短数字选项漏识别、目录串入选项与补扫重复计数；新增保留已有选择的核验入口；最近公开版本仍为 dev.4。先盘点整页视频和各自完成状态，再处理未完成项；本页结束后按目录查找橙色待办。
+> 当前预发布版 dev.8 修复章节测验短数字选项漏识别、目录串入选项与补扫重复计数，新增保留已有选择的核验入口，并包含进度悬浮窗、前台等待恢复和弹题合框修复。先盘点整页视频和各自完成状态，再处理未完成项；本页结束后按目录查找橙色待办。
 >
-> [下载 v2.0.0-dev.4](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.4) · [Windows 免安装包](https://github.com/1145997/coursebot/releases/download/v2.0.0-dev.4/CourseBot-v2.0.0-dev.4-win64.zip) · [更新记录](RELEASE_NOTES.md) · [实测范围](docs/VALIDATION.md)
+> [下载 v2.0.0-dev.8](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.8) · [Windows 免安装包](https://github.com/1145997/coursebot/releases/download/v2.0.0-dev.8/CourseBot-v2.0.0-dev.8-win64.zip) · [更新记录](RELEASE_NOTES.md) · [实测范围](docs/VALIDATION.md)
 
 Windows 桌面端网课自动化工具：
 
@@ -64,7 +64,7 @@ Windows 桌面端网课自动化工具：
 
 ## 3. 发布版使用
 
-1. 从 [v2.0.0-dev.4 Release](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.4) 下载 `CourseBot-v2.0.0-dev.4-win64.zip`，解压完整目录；
+1. 从 [v2.0.0-dev.8 Release](https://github.com/1145997/coursebot/releases/tag/v2.0.0-dev.8) 下载 `CourseBot-v2.0.0-dev.8-win64.zip`，解压完整目录；
 2. 必须保留 `CourseBot.exe` 和 `_internal` 文件夹在同一目录；
 3. 双击 `CourseBot.exe`；
 4. 首次运行会在 exe 同级生成：
@@ -79,7 +79,7 @@ Windows 桌面端网课自动化工具：
 发布页提供 `SHA256SUMS.txt`，可核对下载文件：
 
 ```powershell
-Get-FileHash .\CourseBot-v2.0.0-dev.4-win64.zip -Algorithm SHA256
+Get-FileHash .\CourseBot-v2.0.0-dev.8-win64.zip -Algorithm SHA256
 ```
 
 发布版未做数字签名，Windows 可能显示 SmartScreen 提示。
