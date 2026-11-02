@@ -922,7 +922,12 @@ def _extract_options(lines: list[OcrLine], kind: str) -> tuple[list[QuizOption],
             body = m.group(2).strip(" .．、:：")
             if body and len(body) <= 500:
                 old = options.get(letter)
-                if old is None or len(body) > len(old.text):
+                canonical = {"对", "错", "正确", "错误", "是", "否"}
+                clean = kind == "判断题" and compact_text(body) in canonical
+                old_clean = old is not None and kind == "判断题" and compact_text(old.text) in canonical
+                if (old is None or (clean and not old_clean) or
+                        (clean and old_clean and line.height < old.line.height) or
+                        (not old_clean and len(body) > len(old.text))):
                     options[letter] = QuizOption(letter, body, line)
             else:
                 standalone[letter] = line
@@ -1246,8 +1251,12 @@ def analyze_page(
     if not view.exam.detected:
         view.quiz = detect_quiz(lines, w, h)
         marker = _popup_marker(lines, w, view.quiz.submit)
+        suspect_judgment = view.quiz.kind == "判断题" and any(
+            compact_text(option.text) not in {"对", "错", "正确", "错误", "是", "否"} or
+            (view.quiz.submit and option.line.height > view.quiz.submit.height * 1.8)
+            for option in view.quiz.options)
         if (popup_reader and marker and view.quiz.submit and
-                (len(view.quiz.options) < 2 or (view.quiz.kind == "判断题" and
+                (len(view.quiz.options) < 2 or suspect_judgment or (view.quiz.kind == "判断题" and
                  {option.letter for option in view.quiz.options} != {"A", "B"}))):
             # 全屏 OCR 可能把 A 与讲义背景合并；窄列重扫保留窗口坐标。
             x0 = max(0, marker.x0 - max(18, marker.height))

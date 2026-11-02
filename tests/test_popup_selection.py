@@ -91,10 +91,77 @@ class PopupSelectionTests(unittest.TestCase):
 
     def test_missing_round_control_is_not_clicked_or_submitted(self):
         pixels = np.full((1528, 2560, 3), (100, 50, 0), np.uint8)
-        _, confirmed = self.w._set_popup_radio(self.q, "A", Frame(pixels, 0, 0, 0))
+        frame = Frame(pixels, 0, 0, 0)
+        self.w._grab = Mock(return_value=frame)
+        self.w._scan = Mock(return_value=PageView(2560, 1528, [], quiz=self.q))
+        _, confirmed = self.w._set_popup_radio(self.q, "A", frame)
         self.assertFalse(confirmed)
         self.w._click_screen.assert_not_called()
         self.w._click_line.assert_not_called()
+        self.assertEqual(self.w._grab.call_count, 2)
+
+    def test_large_merged_option_box_does_not_change_radio_size_or_offset(self):
+        self.q.options[0] = QuizOption("A", "背景讲义", line("A)背景讲义", 396, 673, 758, 764))
+        controls = self.w._popup_radio_controls(self.frame, self.q)
+        self.assertEqual(set(controls), {"A", "B"})
+        self.assertLessEqual(abs(controls["A"][0][0] - 371), 3)
+        self.assertLessEqual(abs(controls["A"][0][1] - 702), 3)
+        self.assertEqual(self.w._popup_selected_letters(self.frame, self.q), {"B"})
+
+    def test_large_a_box_cannot_borrow_bs_circle_when_a_is_missing(self):
+        self.q.options[0] = QuizOption("A", "背景讲义", line("A)背景讲义", 396, 673, 758, 764))
+        pixels = self.frame.image.copy()
+        cv2.circle(pixels, (371, 702), 18, (0, 0, 0), -1)
+        controls = self.w._popup_radio_controls(Frame(pixels, 0, 0, 0), self.q)
+        self.assertNotIn("A", controls)
+        self.assertIn("B", controls)
+
+    def test_two_options_still_trigger_focused_recovery_when_a_contains_lecture(self):
+        lines = [line("判断题", 289, 531, 374, 561), line("判断题题干", 355, 593, 800, 623),
+                 line("A)背景讲义", 396, 673, 758, 764), line("B、错", 410, 778, 484, 812),
+                 line("提交", 1619, 1261, 1669, 1290)]
+        reader = Mock(return_value=[line("A、对", 153, 129, 220, 155),
+                                    line("B、错", 151, 220, 221, 249),
+                                    line("背景文字", 210, 130, 330, 187)])
+        found = analyze_page(self.frame.image, lines, popup_reader=reader).quiz
+        reader.assert_called_once()
+        self.assertEqual(found.options[0].text, "对")
+        self.assertEqual(found.options[0].line.height, 26)
+        self.assertEqual((found.options[0].line.x0, found.options[0].line.y0), (412, 690))
+
+    def test_canonical_judgment_label_wins_over_longer_lecture_in_either_order(self):
+        bad = line("A)背景讲义文字", 396, 673, 758, 764)
+        good = line("A、对", 412, 690, 480, 716)
+        for ordered in ([bad, good], [good, bad]):
+            with self.subTest(first=ordered[0].text):
+                found = detect_quiz(incomplete_ocr() + ordered, 2560, 1528)
+                self.assertEqual(found.options[0].text, "对")
+                self.assertEqual(found.options[0].line.height, 26)
+
+    def test_temporary_missing_circle_is_reread_before_clicking_the_real_control(self):
+        before = Frame(np.zeros_like(self.frame.image), 0, 0, 0)
+        after = self.frame.image.copy()
+        cv2.circle(after, (371, 702), 12, (255, 150, 60), -1)
+        cv2.circle(after, (371, 794), 12, (255, 255, 255), -1)
+        self.w._grab = Mock(side_effect=[self.frame, Frame(after, 0, 0, 0)])
+        self.w._scan = Mock(return_value=PageView(2560, 1528, [], quiz=self.q))
+        _, confirmed = self.w._set_popup_radio(self.q, "A", before)
+        self.assertTrue(confirmed)
+        self.w._click_screen.assert_called_once()
+        self.w._click_line.assert_not_called()
+
+    def test_recovery_rejects_a_different_question_without_clicking(self):
+        changed = quiz()
+        changed.question = "另一道题"
+        before = Frame(np.zeros_like(self.frame.image), 0, 0, 0)
+        selected_a = self.frame.image.copy()
+        cv2.circle(selected_a, (371, 702), 12, (255, 150, 60), -1)
+        cv2.circle(selected_a, (371, 794), 12, (255, 255, 255), -1)
+        self.w._grab = Mock(return_value=Frame(selected_a, 0, 0, 0))
+        self.w._scan = Mock(return_value=PageView(2560, 1528, [], quiz=changed))
+        _, confirmed = self.w._set_popup_radio(self.q, "A", before)
+        self.assertFalse(confirmed)
+        self.w._click_screen.assert_not_called()
 
     def test_explicit_judgment_type_is_not_changed_by_color_or_parentheses(self):
         self.q.question = "题干包含（）和()"

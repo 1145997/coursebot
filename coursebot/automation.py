@@ -2652,27 +2652,41 @@ class AutomationWorker(threading.Thread):
         """先确认圆形控件，再读圆内颜色，避免蓝色讲义背景被当作选中。"""
         controls = {}
         h, w = frame.image.shape[:2]
-        for opt in quiz.options:
+        heights = [opt.line.height for opt in quiz.options]
+        if quiz.submit:
+            heights.append(quiz.submit.height)
+        # OCR 可能把小号选项与大号讲义合框，控件尺寸不能随异常行高一起放大。
+        reference = max(20, min(64, min(heights, default=28)))
+        ordered = sorted(quiz.options, key=lambda option: option.line.cy)
+        for index, opt in enumerate(ordered):
             line = opt.line
-            margin = max(24, int(line.height * .9))
-            x0, x1 = max(0, line.x0 - 100), min(w, line.x0 - 15)
-            y0, y1 = max(0, line.cy - margin), min(h, line.cy + margin)
+            margin = max(24, reference)
+            x0 = max(0, line.x0 - max(100, reference * 4))
+            x1 = min(w, line.x0 + reference // 2)
+            y0, y1 = max(0, line.y0 - margin), min(h, line.y1 + margin)
+            # 不能借用相邻选项的圆钮，尤其不能把 B 的按钮配给大框中的 A。
+            if index:
+                y0 = max(y0, (ordered[index - 1].line.cy + line.cy) // 2)
+            if index + 1 < len(ordered):
+                y1 = min(y1, (line.cy + ordered[index + 1].line.cy) // 2)
             if x1 <= x0 or y1 <= y0:
                 continue
             roi = frame.image[y0:y1, x0:x1]
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, 15, param1=80, param2=10,
-                                      minRadius=max(5, int(line.height * .2)),
-                                      maxRadius=min(24, max(12, int(line.height * .8))))
+                                      minRadius=max(5, int(reference * .2)),
+                                      maxRadius=min(48, max(12, int(reference * .8))))
             if circles is None:
                 continue
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
-            expected_x = line.x0 - 42 * max(.9, line.height / 28)
+            expected_x = line.x0 - 42 * max(.9, reference / 28)
             candidates = []
             for x, y, radius in circles[0]:
-                distance = ((x + x0 - expected_x) ** 2 + (y + y0 - line.cy) ** 2) ** .5
-                if distance > max(16, line.height * .8):
+                dx = abs(x + x0 - expected_x)
+                dy = max(line.y0 - (y + y0), (y + y0) - line.y1, 0)
+                distance = (dx ** 2 + dy ** 2) ** .5
+                if distance > max(24, reference):
                     continue
                 disk = (xx - x) ** 2 + (yy - y) ** 2 <= (radius * .95) ** 2
                 if not np.any(disk) or float((hsv[:, :, 2][disk] >= 150).mean()) < .55:
@@ -2680,7 +2694,8 @@ class AutomationWorker(threading.Thread):
                 blue = ((hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 175) &
                         (hsv[:, :, 1] >= 80) & (hsv[:, :, 2] >= 125))
                 selected = float(blue[disk].mean()) > .18
-                candidates.append((distance, (int(round(x + x0)), int(round(y + y0))), selected))
+                score = distance + abs(y + y0 - line.cy) * .3
+                candidates.append((score, (int(round(x + x0)), int(round(y + y0))), selected))
             if candidates:
                 _, center, selected = min(candidates, key=lambda item: item[0])
                 controls[opt.letter] = (center, selected)
@@ -2733,24 +2748,37 @@ class AutomationWorker(threading.Thread):
         opt = quiz.option_map().get(letter)
         if opt is None:
             return frame, False
-        for attempt in range(2):
+        for attempt in range(3):
             controls = self._popup_radio_controls(frame, quiz)
-            if letter not in controls:
-                return frame, False
-            selected = {key for key, (_, checked) in controls.items() if checked}
-            if selected == {letter}:
-                self._log(f"已确认选中弹题选项 {letter}")
-                return frame, True
-            if attempt == 0:
+            if letter in controls:
+                selected = {key for key, (_, checked) in controls.items() if checked}
+                if selected == {letter}:
+                    self._log(f"已确认选中弹题选项 {letter}")
+                    return frame, True
+                if attempt == 2:
+                    break
                 x, y = controls[letter][0]
                 self._click_screen(self.window.left + x, self.window.top + y, f"弹题单选圆圈 {letter}")
             else:
-                self._click_line(opt.line, f"弹题选项 {letter} 文本")
-            self._sleep(.15)
+                self._log(f"暂未定位到选项 {letter} 的真实圆钮，复核 {attempt + 1}/3；不猜文字框坐标", "warning")
+                if attempt == 2:
+                    break
+            self._sleep(.3)
             frame = self._grab()
+            if letter not in controls:
+                refreshed = self._scan(frame, track_time=False).quiz
+                if (not refreshed.detected or refreshed.kind != quiz.kind or
+                        compact_text(refreshed.question) != compact_text(quiz.question) or
+                        set(refreshed.option_map()) != set(quiz.option_map())):
+                    self._save_debug(frame, "popup_radio_context_changed")
+                    return frame, False
+                quiz.options = refreshed.options
+                quiz.submit = refreshed.submit
         confirmed = self._popup_selected_letters(frame, quiz) == {letter}
         if confirmed:
             self._log(f"已确认选中弹题选项 {letter}")
+        else:
+            self._save_debug(frame, "popup_radio_unconfirmed")
         return frame, confirmed
 
     def _submit_popup_answer(self, quiz: QuizView) -> tuple[Frame, str, QuizView | None]:
