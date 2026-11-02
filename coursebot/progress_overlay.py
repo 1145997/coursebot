@@ -12,7 +12,7 @@ from .capture import register_capture_overlay, unregister_capture_overlay
 
 class ProgressOverlay:
     def __init__(self, root: tk.Tk, scale: float, on_open: Callable,
-                 on_stop: Callable, on_close: Callable):
+                 on_stop: Callable, on_close: Callable, on_return: Callable):
         self.root = root
         self.scale = scale
         self.window = tk.Toplevel(root)
@@ -62,6 +62,8 @@ class ProgressOverlay:
         footer = tk.Frame(card, bg="#0f172a")
         footer.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(self.px(8), 0))
         self._button(footer, "主窗口", on_open).pack(side="left")
+        self.return_button = self._button(footer, "回到课程", on_return, fg="#38bdf8")
+        self.return_button.pack(side="left", padx=self.px(4))
         self.stop_button = self._button(footer, "停止 F8", on_stop, fg="#fca5a5")
         self.stop_button.pack(side="right")
         self.stop_button.configure(state="disabled")
@@ -128,6 +130,7 @@ class ProgressOverlay:
         self.stats.configure(text=stats)
         self.stop_button.configure(state="normal" if running and not stopping else "disabled",
                                    text="停止中…" if stopping else "停止 F8")
+        self.return_button.configure(state="normal" if running and not stopping else "disabled")
 
     def _begin_drag(self, event) -> None:
         self._drag_origin = (event.x_root, event.y_root, self.window.winfo_x(), self.window.winfo_y())

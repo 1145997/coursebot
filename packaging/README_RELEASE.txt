@@ -1,4 +1,4 @@
-CourseBot v2.0.0-dev.5  Windows 本地测试版
+CourseBot v2.0.0-dev.6  Windows 本地测试版
 =================================
 
 一、怎么启动
@@ -42,7 +42,7 @@ CourseBot v2.0.0-dev.5  Windows 本地测试版
 4. F8 失效：可能被其他软件占用，用界面“停止”按钮。
 5. 换电脑：整个文件夹一起复制，config.json 和 logs 会跟随。
 
-版本：2.0.0-dev.5
+版本：2.0.0-dev.6
 构建日期：2026-11-02
 
 
@@ -50,3 +50,5 @@ CourseBot v2.0.0-dev.5  Windows 本地测试版
 
 公开版本：https://github.com/1145997/coursebot/releases
 本包不含个人配置及日志，完整实测范围见 docs/VALIDATION.md。
+
+切到其它窗口时暂停输入并持续保留任务，不再三分钟自动停止；回到课程后重新识别页面。

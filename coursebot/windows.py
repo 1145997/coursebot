@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from ctypes import wintypes
@@ -245,6 +246,26 @@ def is_foreground(hwnd: int) -> bool:
         return bool(user32.IsChild(hwnd, fg))
     except Exception:
         return False
+
+
+def window_exists(hwnd: int) -> bool:
+    return bool(hwnd and user32.IsWindow(hwnd))
+
+
+def foreground_description() -> str:
+    """本地诊断仅区分助手窗口与其它应用，不记录其它应用的标题。"""
+    fg = user32.GetForegroundWindow()
+    if not fg:
+        return "无前台窗口"
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        title = ctypes.create_unicode_buffer(128)
+        user32.GetWindowTextW(fg, title, len(title))
+        if title.value == "CourseBot · 运行进度":
+            return "进度悬浮窗"
+        return "助手主界面或其它助手窗口"
+    return f"其它应用窗口（句柄 {int(fg)}）"
 
 
 def focus_window(hwnd: int) -> bool:

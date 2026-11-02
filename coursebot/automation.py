@@ -45,10 +45,12 @@ from .windows import (
     WindowInfo,
     cursor_position,
     focus_window,
+    foreground_description,
     get_window_info,
     is_foreground,
     maximize_window,
     virtual_screen,
+    window_exists,
 )
 
 
@@ -58,6 +60,10 @@ class StopAutomation(Exception):
 
 class NavigationFailed(Exception):
     pass
+
+
+class ForegroundRecheck(BaseException):
+    """前台等待后撤销待执行动作；不得被鼠标/测验的普通失败重试吞掉。"""
 
 
 class AutomationWorker(threading.Thread):
@@ -139,6 +145,7 @@ class AutomationWorker(threading.Thread):
         self._pending_writeback_at = None
         self._last_popup_probe_at = 0.0
         self._popup_unreadable_since = None
+        self._focus_generation = 0
 
     # ------------------------------------------------------------------ 基础
     def _setup_logging(self) -> None:
@@ -260,7 +267,10 @@ class AutomationWorker(threading.Thread):
             if self.settings.dry_run:
                 self._log("试运行模式：只识别、不点击", "warning")
             self._preflight()
-            self._start()
+            try:
+                self._start()
+            except ForegroundRecheck:
+                self._log("前台已恢复，撤销等待前的动作并重新识别页面", "warning")
             self._main_loop()
         except StopAutomation:
             self._log("自动化已停止")
@@ -817,7 +827,17 @@ class AutomationWorker(threading.Thread):
     # ------------------------------------------------------------------ 主循环
     def _main_loop(self) -> None:
         while not self.stop_event.is_set():
+            try:
+                self._main_loop_run()
+                return
+            except ForegroundRecheck:
+                self._log("前台已恢复，撤销等待前的动作并重新识别页面", "warning")
+
+    def _main_loop_run(self) -> None:
+        while not self.stop_event.is_set():
             self._check_stop()
+            if not self._ensure_foreground():
+                raise StopAutomation()
             if self._browser_reader and self._accessible_video_tick():
                 if self.settings.preview_enabled and time.time() - self.last_preview >= 2:
                     # 此模式不运行旧 OCR 播放循环；仍更新真实画面，避免显示上一页的旧预览。
@@ -930,8 +950,11 @@ class AutomationWorker(threading.Thread):
         if not self._browser_reader:
             return False
         self._check_stop()
+        generation = self._focus_generation
         if not self._ensure_foreground():
             raise StopAutomation()
+        if generation != self._focus_generation:
+            snapshot = None
         snapshot = snapshot or self._browser_reader.read()
         if not snapshot.complete or not snapshot.page_key:
             now = time.monotonic()
@@ -1071,6 +1094,7 @@ class AutomationWorker(threading.Thread):
 
     def _activate_accessible(self, token: str, identity: str) -> bool:
         """失败后只重新观察，不在旧控件上重复切换播放或重复导航。"""
+        self._require_input_foreground()
         try:
             self._browser_reader.activate(token, self._click_screen)
         except AccessibilityActionError as exc:
@@ -1810,8 +1834,7 @@ class AutomationWorker(threading.Thread):
             if not quiet:
                 self._log(f"[试运行] 将滚动章节测验（{direction}）", "dry")
             return
-        if not self._ensure_foreground():
-            return
+        self._require_input_foreground()
         x = self.window.left + int(self.window.width * 0.35)
         y = self.window.top + int(self.window.height * 0.58)
         self.clicker.scroll(x, y, amount if up else -amount)
@@ -3550,8 +3573,7 @@ class AutomationWorker(threading.Thread):
         if self.settings.dry_run:
             self._log(f"[试运行] 将点击：{desc} @ ({x}, {y})", "dry")
             return
-        if not self._ensure_foreground():
-            return
+        self._require_input_foreground()
         try:
             self.clicker.click(x, y)
         except MouseInputError as exc:
@@ -3572,23 +3594,51 @@ class AutomationWorker(threading.Thread):
         if self.clicker.last_error:
             self._log(f"鼠标输入告警：{self.clicker.last_error}", "warning")
 
-    def _ensure_foreground(self, timeout: float = 180.0) -> bool:
+    def _require_input_foreground(self) -> None:
+        generation = self._focus_generation
+        if not self._ensure_foreground():
+            raise StopAutomation()
+        if generation != self._focus_generation:
+            raise ForegroundRecheck()
+
+    def _reset_after_focus_wait(self) -> None:
+        self._focus_generation += 1
+        self._force_full = True
+        self.time_box = None
+        self.time_reading = None
+        self.duration = 0.0
+        self.view = None
+        self.quiz_active = self.exam_active = self.navigating = False
+        self.last_full_scan = 0
+        self._last_popup_probe_at = 0
+        self._last_geom_check = 0
+        self._pending_writeback_at = None
+        self._body_signature = None
+        self._action_failures.clear()
+        self._refresh_geometry()
+        self._status("scanning", "前台已恢复，正在重新识别页面", duration=0)
+
+    def _ensure_foreground(self) -> bool:
         if self.settings.dry_run:
             return True
-        start = time.time()
+        start = time.monotonic()
+        last_notice = -10.0
         warned = False
-        while time.time() - start < timeout:
+        while True:
             if self.stop_event.is_set():
                 return False
+            if not window_exists(self.window.hwnd):
+                raise NavigationFailed("目标浏览器窗口已关闭，请重新选择课程窗口")
             if is_foreground(self.window.hwnd):
                 if warned:
-                    self._log("目标窗口已回到前台，继续", "success")
+                    self._log("目标窗口已回到前台，重新识别后继续", "success")
+                    self._reset_after_focus_wait()
                 return True
             if not warned:
-                self._log("目标窗口不在前台，已暂停点击；切回浏览器后自动继续", "warning")
-                self._status("waiting_focus", "等待浏览器回到前台")
+                self._log(f"目标窗口不在前台，当前为{foreground_description()}；已暂停，任务将保留等待恢复", "warning")
                 warned = True
-            time.sleep(0.4)
-        self._log("目标窗口长时间不在前台，停止自动化", "error")
-        self.stop_event.set()
-        return False
+            elapsed = time.monotonic() - start
+            if elapsed - last_notice >= 10:
+                self._status("waiting_focus", f"已暂停 {int(elapsed)} 秒，点“回到课程”或切回浏览器继续", duration=0)
+                last_notice = elapsed
+            self.stop_event.wait(0.4)

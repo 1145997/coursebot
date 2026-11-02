@@ -928,6 +928,13 @@ class CourseBotApp:
         self.root.lift()
         self.root.focus_force()
 
+    def _return_to_course(self) -> None:
+        if not self.running or self.stop_event.is_set() or not self.worker:
+            return
+        self.root.iconify()
+        if not focus_window(self.worker.window.hwnd):
+            self._append_log("warning", "未能切回目标课程，请手动切换浏览器；任务仍保持等待")
+
     def _apply_progress_overlay(self) -> None:
         if not self.var_overlay.get():
             if self._progress_overlay is not None:
@@ -936,7 +943,8 @@ class CourseBotApp:
         created = self._progress_overlay is None
         if created:
             self._progress_overlay = ProgressOverlay(
-                self.root, self.s, self._show_main_window, self.stop, self._hide_progress_overlay)
+                self.root, self.s, self._show_main_window, self.stop, self._hide_progress_overlay,
+                self._return_to_course)
         self._sync_progress_overlay()
         self._progress_overlay.show()
         if created and not self._progress_overlay.capture_excluded:
